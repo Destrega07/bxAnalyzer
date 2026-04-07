@@ -5,17 +5,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { parseMarkdownTables } from "@/lib/markdownTableParser";
 import { useCaseContext } from "@/context/CaseContext";
 import { ArrowRight, ChevronDown, Loader2, Send, Upload } from "lucide-react";
-import { makePolicyRowId } from "@/lib/reviewIds";
-import { getConfirmedPolicyRows } from "@/lib/reviewConfirmedPolicies";
+import {
+  getConfirmedPolicyRows,
+  getReviewPolicyCards,
+} from "@/lib/reviewConfirmedPolicies";
 import { cleanInsuranceData } from "@/lib/cleaner";
-
-type PolicyTableRef = {
-  sectionIndex: number;
-  sectionHeading: string;
-  tableIndex: number;
-  headers: string[];
-  rows: Record<string, string>[];
-};
 
 const overviewCardId = "overview:stats";
 
@@ -78,70 +72,6 @@ function extractMonthlyPremiums(parsed: ReturnType<typeof parseMarkdownTables>) 
   return rows;
 }
 
-function getCell(row: Record<string, string>, candidates: string[]) {
-  for (const key of candidates) {
-    const value = row[key];
-    if (typeof value === "string" && value.trim().length > 0) return value.trim();
-  }
-  return "";
-}
-
-function scorePolicyTable(sectionHeading: string, headers: string[]) {
-  const headingScore = (() => {
-    if (sectionHeading.includes("投保人视图")) return 50;
-    if (sectionHeading.includes("被保人视图")) return 40;
-    if (sectionHeading.includes("保单信息")) return 10;
-    return 0;
-  })();
-
-  const headerScore = (() => {
-    const has = (name: string) => headers.includes(name);
-    return (
-      (has("保险条款名称") ? 20 : 0) +
-      (has("生效日期") ? 20 : 0) +
-      (has("被保人") || has("被保险人") ? 10 : 0) +
-      (has("满期日期") ? 5 : 0) +
-      (has("主附险") ? 5 : 0)
-    );
-  })();
-
-  return headingScore + headerScore;
-}
-
-function findBestPolicyTable(parsedSections: {
-  heading: string;
-  tables: Array<{ headers: string[]; rows: Record<string, string>[] }>;
-}[]): PolicyTableRef | null {
-  let bestRef: PolicyTableRef | null = null;
-  let bestScore = -1;
-
-  parsedSections.forEach((section, sectionIndex) => {
-    section.tables.forEach((table, tableIndex) => {
-      const headers = table.headers ?? [];
-      const hasKey = (k: string) => headers.includes(k);
-      const looksLikePolicyTable =
-        hasKey("保险条款名称") && hasKey("生效日期") && headers.length >= 3;
-
-      if (!looksLikePolicyTable) return;
-
-      const score = scorePolicyTable(section.heading, headers);
-      const ref: PolicyTableRef = {
-        sectionIndex,
-        sectionHeading: section.heading,
-        tableIndex,
-        headers,
-        rows: table.rows ?? [],
-      };
-      if (score > bestScore) {
-        bestScore = score;
-        bestRef = ref;
-      }
-    });
-  });
-
-  return bestRef;
-}
-
 function isFlaggedValue(fieldName: string, value: string) {
   if (value.includes("!!")) return true;
   const v = value.trim();
@@ -184,7 +114,6 @@ export default function ReviewPage() {
   const [cleanWarning, setCleanWarning] = useState<string | null>(null);
 
   const parsedMeta = state.parsed?.meta;
-  const customerName = parsedMeta?.customerName;
   const reportId = parsedMeta?.reportId;
 
   const summary = useMemo(() => {
@@ -198,32 +127,24 @@ export default function ReviewPage() {
     return { sectionCount: sections.length, tableCount, rowCount };
   }, [state.parsed]);
 
-  const policyTable = useMemo(() => {
-    const sections = state.parsed?.sections ?? [];
-    return findBestPolicyTable(sections);
-  }, [state.parsed]);
-
   const policyCards = useMemo(() => {
-    if (!policyTable) return [];
-    return policyTable.rows.map((row, rowIndex) => {
-      const id = makePolicyRowId(
-        policyTable.sectionIndex,
-        policyTable.tableIndex,
-        rowIndex,
-      );
-      const productName = getCell(row, ["产品名称", "保险条款名称", "保险产品名称"]);
-      const insuredRaw = getCell(row, [
-        "被保人",
-        "被保险人",
-        "被保人姓名",
-        "投保人",
-      ]);
+    return getReviewPolicyCards(state.parsed).map((card) => {
+      const productName =
+        card.row["产品名称"]?.trim() ||
+        card.row["保险条款名称"]?.trim() ||
+        card.row["保险产品名称"]?.trim() ||
+        "未命名产品";
       const insured =
-        insuredRaw === "本人" && customerName ? customerName : insuredRaw;
-      const effectiveDate = getCell(row, ["生效日期", "生效日"]);
-      return { id, rowIndex, row, productName, insured, effectiveDate };
+        card.row["被保人"]?.trim() ||
+        card.row["被保险人"]?.trim() ||
+        card.row["被保人姓名"]?.trim() ||
+        card.row["被保人名称"]?.trim() ||
+        "-";
+      const effectiveDate =
+        card.row["生效日期"]?.trim() || card.row["生效日"]?.trim() || "-";
+      return { ...card, productName, insured, effectiveDate };
     });
-  }, [policyTable, customerName]);
+  }, [state.parsed]);
 
   const confirmStats = useMemo(() => {
     const total = policyCards.length;
@@ -238,29 +159,50 @@ export default function ReviewPage() {
         const name = parsed.meta.customerName;
         if (!name) return parsed;
 
-        const ref = findBestPolicyTable(parsed.sections);
-        if (!ref) return parsed;
-
         const sections = parsed.sections.slice();
-        const section = sections[ref.sectionIndex];
-        if (!section) return parsed;
-        const tables = section.tables.slice();
-        const table = tables[ref.tableIndex];
-        if (!table) return parsed;
+        let changed = false;
 
-        const rows = table.rows.map((row) => {
-          const nextRow = { ...row };
-          (["被保人", "被保险人", "被保人姓名"] as const).forEach((k) => {
-            if (typeof nextRow[k] === "string" && nextRow[k].trim() === "本人") {
-              nextRow[k] = name;
-            }
+        parsed.sections.forEach((section, sectionIndex) => {
+          const tables = section.tables.map((table) => {
+            const headers = table.headers ?? [];
+            const looksLikePolicyTable =
+              headers.includes("保险条款名称") &&
+              headers.includes("生效日期") &&
+              headers.length >= 3;
+            if (!looksLikePolicyTable) return table;
+
+            let tableChanged = false;
+            const rows = table.rows.map((row) => {
+              let nextRow = row;
+              (["被保人", "被保险人", "被保人姓名", "投保人"] as const).forEach((key) => {
+                if (typeof nextRow[key] === "string" && nextRow[key].trim() === "本人") {
+                  nextRow = { ...nextRow, [key]: name };
+                }
+              });
+              if (
+                section.heading.includes("被保人视图") &&
+                !("被保人" in nextRow) &&
+                !("被保险人" in nextRow) &&
+                !("被保人姓名" in nextRow)
+              ) {
+                nextRow = { ...nextRow, 被保人: name };
+              }
+              if (nextRow !== row) {
+                tableChanged = true;
+                changed = true;
+              }
+              return nextRow;
+            });
+
+            return tableChanged ? { ...table, rows } : table;
           });
-          return nextRow;
+
+          if (tables.some((table, tableIndex) => table !== section.tables[tableIndex])) {
+            sections[sectionIndex] = { ...section, tables };
+          }
         });
 
-        tables[ref.tableIndex] = { ...table, rows };
-        sections[ref.sectionIndex] = { ...section, tables };
-        return { ...parsed, sections };
+        return changed ? { ...parsed, sections } : parsed;
       })();
       setExpandedById({});
       const extractedMonthly = extractMonthlyPremiums(nextParsed);
@@ -632,27 +574,38 @@ export default function ReviewPage() {
     });
   }
 
-  function updatePolicyCell(rowIndex: number, fieldName: string, value: string) {
-    if (!policyTable) return;
+  function updatePolicyCell(
+    card: (typeof policyCards)[number],
+    fieldName: string,
+    value: string,
+  ) {
     setState((prev) => {
       const parsed = prev.parsed;
       if (!parsed) return prev;
 
       const sections = parsed.sections.slice();
-      const section = sections[policyTable.sectionIndex];
-      if (!section) return prev;
-      const tables = section.tables.slice();
-      const table = tables[policyTable.tableIndex];
-      if (!table) return prev;
+      let changed = false;
 
-      const rows = table.rows.slice();
-      const row = rows[rowIndex];
-      if (!row) return prev;
-      if ((row[fieldName] ?? "") === value) return prev;
+      card.sourceRefs.forEach((ref) => {
+        if (!ref.headers.includes(fieldName)) return;
+        const section = sections[ref.sectionIndex];
+        if (!section) return;
+        const tables = section.tables.slice();
+        const table = tables[ref.tableIndex];
+        if (!table) return;
 
-      rows[rowIndex] = { ...row, [fieldName]: value };
-      tables[policyTable.tableIndex] = { ...table, rows };
-      sections[policyTable.sectionIndex] = { ...section, tables };
+        const rows = table.rows.slice();
+        const row = rows[ref.rowIndex];
+        if (!row) return;
+        if ((row[fieldName] ?? "") === value) return;
+
+        rows[ref.rowIndex] = { ...row, [fieldName]: value };
+        tables[ref.tableIndex] = { ...table, rows };
+        sections[ref.sectionIndex] = { ...section, tables };
+        changed = true;
+      });
+
+      if (!changed) return prev;
 
       return {
         ...prev,
@@ -959,7 +912,7 @@ export default function ReviewPage() {
           </div>
         </div>
 
-        {!policyTable ? (
+        {policyCards.length === 0 ? (
           <div className="rounded-xl border border-dashed border-zinc-300 bg-white p-6 text-sm text-zinc-600">
             暂未识别到“保单信息”表格。请先在上方粘贴 Markdown 并解析保存。
           </div>
@@ -1032,7 +985,7 @@ export default function ReviewPage() {
                   {expanded ? (
                     <div className="border-t border-zinc-200 px-4 py-4">
                       <div className="grid gap-3 sm:grid-cols-2">
-                        {policyTable.headers.map((fieldName) => {
+                        {card.headers.map((fieldName) => {
                           const value = card.row[fieldName] ?? "";
                           const flagged = isFlaggedValue(fieldName, value);
                           return (
@@ -1043,7 +996,7 @@ export default function ReviewPage() {
                               <input
                                 value={value}
                                 onChange={(e) =>
-                                  updatePolicyCell(card.rowIndex, fieldName, e.target.value)
+                                  updatePolicyCell(card, fieldName, e.target.value)
                                 }
                                 className={[
                                   "h-10 w-full rounded-lg border px-3 text-sm outline-none",
