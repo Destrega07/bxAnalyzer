@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { Download, Plus, Search, Upload } from "lucide-react";
 import CaseCard from "@/components/CaseCard";
 import { useCaseContext } from "@/context/CaseContext";
-import type { CaseRecord, CaseStatus } from "@/lib/db";
+import type { CaseRecord, CaseStatus, ProtectionRatingLabel } from "@/lib/db";
 
 function bytesToBase64(bytes: Uint8Array) {
   let binary = "";
@@ -54,7 +54,6 @@ function downloadText(filename: string, text: string) {
 }
 
 type SortKey = "updatedAtDesc" | "nameAsc";
-type StatusFilterKey = "all" | CaseStatus;
 
 export default function Home() {
   const router = useRouter();
@@ -69,7 +68,8 @@ export default function Home() {
   } = useCaseContext();
   const [search, setSearch] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("updatedAtDesc");
-  const [statusFilter, setStatusFilter] = useState<StatusFilterKey>("all");
+  const [statusFilters, setStatusFilters] = useState<CaseStatus[]>([]);
+  const [ratingFilters, setRatingFilters] = useState<ProtectionRatingLabel[]>([]);
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const [busy, setBusy] = useState<null | "export" | "import">(null);
 
@@ -78,10 +78,14 @@ export default function Home() {
     const nameFiltered = keyword.length
       ? caseSummaries.filter((c) => (c.customerName ?? "").includes(keyword))
       : caseSummaries.slice();
-    const rows =
-      statusFilter === "all"
-        ? nameFiltered
-        : nameFiltered.filter((c) => c.status === statusFilter);
+    const rows = nameFiltered.filter((c) => {
+      if (statusFilters.length > 0 && !statusFilters.includes(c.status)) return false;
+      if (ratingFilters.length > 0) {
+        const label = c.ratingLabel ?? null;
+        if (!label || !ratingFilters.includes(label)) return false;
+      }
+      return true;
+    });
 
     if (sortKey === "updatedAtDesc") {
       return rows.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
@@ -94,7 +98,7 @@ export default function Home() {
       if (!bn) return -1;
       return an.localeCompare(bn, "zh-CN", { sensitivity: "base" });
     });
-  }, [caseSummaries, search, sortKey, statusFilter]);
+  }, [caseSummaries, search, sortKey, statusFilters, ratingFilters]);
 
   async function handleExport() {
     try {
@@ -131,12 +135,17 @@ export default function Home() {
     router.push("/summary");
   }
 
-  const statusOptions: Array<{ key: StatusFilterKey; label: string }> = [
-    { key: "all", label: "全部" },
+  const statusOptions: Array<{ key: CaseStatus; label: string }> = [
     { key: "pending", label: "待提案" },
     { key: "proposed", label: "已提案" },
     { key: "closed", label: "已成交" },
     { key: "rejected", label: "被拒绝" },
+  ];
+  const ratingOptions: Array<{ key: ProtectionRatingLabel; label: string }> = [
+    { key: "完美配置", label: "完美配置" },
+    { key: "优质配置", label: "优质配置" },
+    { key: "合格配置", label: "合格配置" },
+    { key: "保障薄弱", label: "保障薄弱" },
   ];
 
   return (
@@ -227,14 +236,23 @@ export default function Home() {
           </div>
 
           <div className="-mx-1 overflow-x-auto px-1">
-            <div className="flex w-max gap-2">
+            <div className="flex w-max items-center gap-2">
+              <div className="shrink-0 text-xs font-medium text-zinc-600">
+                跟进状态
+              </div>
               {statusOptions.map((opt) => {
-                const active = statusFilter === opt.key;
+                const active = statusFilters.includes(opt.key);
                 return (
                   <button
                     key={opt.key}
                     type="button"
-                    onClick={() => setStatusFilter(opt.key)}
+                    onClick={() =>
+                      setStatusFilters((prev) =>
+                        prev.includes(opt.key)
+                          ? prev.filter((k) => k !== opt.key)
+                          : [...prev, opt.key],
+                      )
+                    }
                     className={[
                       "shrink-0 rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors",
                       active
@@ -246,6 +264,39 @@ export default function Home() {
                   </button>
                 );
               })}
+
+              <div className="mx-1 h-5 w-px shrink-0 bg-zinc-200" />
+
+              <div className="shrink-0 text-xs font-medium text-zinc-600">
+                保障评级
+              </div>
+              {ratingOptions.map((opt) => {
+                const active = ratingFilters.includes(opt.key);
+                return (
+                  <button
+                    key={opt.key}
+                    type="button"
+                    onClick={() =>
+                      setRatingFilters((prev) =>
+                        prev.includes(opt.key)
+                          ? prev.filter((k) => k !== opt.key)
+                          : [...prev, opt.key],
+                      )
+                    }
+                    className={[
+                      "shrink-0 rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors",
+                      active
+                        ? "border-zinc-900 bg-zinc-900 text-white"
+                        : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50",
+                    ].join(" ")}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="mt-2 text-xs text-zinc-500">
+              可通过上方按钮筛选客户案卷，点1下按钮激活，再点1下关闭
             </div>
           </div>
         </div>

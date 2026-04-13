@@ -236,6 +236,10 @@ export function getConfirmedPolicyRows(parsed: ParsedMarkdownTables | null, meta
       if (reportSource) {
         nextRow = { ...nextRow, 报告来源: reportSource };
       }
+      const insuranceType = meta[card.id]?.insuranceType;
+      if (insuranceType) {
+        nextRow = { ...nextRow, 险种标签: insuranceType };
+      }
 
       return { id: card.id, rowIndex: card.rowIndex, row: nextRow } satisfies ConfirmedPolicyRow;
     })

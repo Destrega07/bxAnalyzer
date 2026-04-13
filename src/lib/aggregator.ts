@@ -1,4 +1,6 @@
+import type { InsuranceType } from "@/lib/db";
 import type { ParsedMarkdownTables } from "@/lib/markdownTableParser";
+import { inferInsuranceType } from "@/lib/insuranceMapper";
 
 export type PolicyRow = Record<string, string>;
 
@@ -107,6 +109,22 @@ function getPolicyName(row: PolicyRow) {
 
 function getCategory(row: PolicyRow) {
   return getCell(row, ["险种类别", "险种分类", "险种", "险别"]);
+}
+
+function getInsuranceTypeOverride(row: PolicyRow): InsuranceType | "" {
+  const v = getCell(row, ["险种标签", "险种类型", "险种映射"]);
+  if (
+    v === "医疗险" ||
+    v === "意外险" ||
+    v === "重疾险" ||
+    v === "定期寿险" ||
+    v === "终身寿险" ||
+    v === "特定医疗险" ||
+    v === "失能护理险"
+  ) {
+    return v;
+  }
+  return "";
 }
 
 function getPaidPremium(row: PolicyRow) {
@@ -359,6 +377,9 @@ export function aggregateHouseholdModel(
     const policyName = getPolicyName(row) || "未命名保单";
     const category = getCategory(row);
     const reportSource = getReportSource(row) || reportId;
+    const overrideType = getInsuranceTypeOverride(row);
+    const inferred = inferInsuranceType(policyName);
+    const mappedType = overrideType || inferred?.type || "";
 
     const ref: PolicyRef = {
       policyName,
@@ -368,7 +389,7 @@ export function aggregateHouseholdModel(
       raw: row,
     };
 
-    if (isWealthPolicy(category)) {
+    if (mappedType === "终身寿险" || (!mappedType && isWealthPolicy(category))) {
       const paidPremium = getPaidPremium(row);
       ref.paidPremium = paidPremium;
       member.accounts.wealth.paidPremium += paidPremium;
@@ -376,21 +397,30 @@ export function aggregateHouseholdModel(
       return;
     }
 
-    if (isCriticalIllnessPolicy(category)) {
+    if (mappedType === "重疾险" || (!mappedType && isCriticalIllnessPolicy(category))) {
       const amount = getCoverageAmount(row);
       if (amount > 0) ref.amount = amount;
       member.accounts.healthCritical.policies.push(ref);
       return;
     }
 
-    if (isMedicalPolicy(category)) {
+    if (
+      mappedType === "医疗险" ||
+      mappedType === "特定医疗险" ||
+      (!mappedType && isMedicalPolicy(category))
+    ) {
       const amount = getCoverageAmount(row);
       if (amount > 0) ref.amount = amount;
       member.accounts.healthMedical.policies.push(ref);
       return;
     }
 
-    if (isLifeDeathPolicy(category)) {
+    if (
+      mappedType === "意外险" ||
+      mappedType === "定期寿险" ||
+      mappedType === "失能护理险" ||
+      (!mappedType && isLifeDeathPolicy(category))
+    ) {
       const amount = getCoverageAmount(row);
       if (amount > 0) ref.amount = amount;
       member.accounts.lifeDeath.policies.push(ref);

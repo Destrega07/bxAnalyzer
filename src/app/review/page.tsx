@@ -1,6 +1,6 @@
 "use client";
 
-import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { parseMarkdownTables } from "@/lib/markdownTableParser";
 import { useCaseContext } from "@/context/CaseContext";
@@ -10,6 +10,10 @@ import {
   getReviewPolicyCards,
 } from "@/lib/reviewConfirmedPolicies";
 import { cleanInsuranceData } from "@/lib/cleaner";
+import { classifyPersona, getClassificationPillClasses } from "@/lib/classifier";
+import { inferInsuranceType, insuranceTypeOptions } from "@/lib/insuranceMapper";
+import type { InsuranceType } from "@/lib/db";
+import { computeProtectionScore } from "@/lib/scoringEngine";
 
 const overviewCardId = "overview:stats";
 
@@ -97,7 +101,8 @@ function isFlaggedValue(fieldName: string, value: string) {
 }
 
 export default function ReviewPage() {
-  const { state, setState, clear } = useCaseContext();
+  const { state, setState, updateCaseScore } = useCaseContext();
+  const router = useRouter();
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const pollTimerRef = useRef<number | null>(null);
@@ -106,7 +111,9 @@ export default function ReviewPage() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [expandedById, setExpandedById] = useState<Record<string, boolean>>({});
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [password, setPassword] = useState("");
   const [sending, setSending] = useState(false);
+  const [previewingDecrypted, setPreviewingDecrypted] = useState(false);
   const [sendingHint, setSendingHint] = useState<string | null>(null);
   const [sendingProgress, setSendingProgress] = useState(0);
   const [capturedRaw, setCapturedRaw] = useState("");
@@ -115,6 +122,27 @@ export default function ReviewPage() {
 
   const parsedMeta = state.parsed?.meta;
   const reportId = parsedMeta?.reportId;
+  const persona = state.persona;
+  const personaRequiredComplete = Boolean(
+    persona.ageRange && persona.maritalStatus && persona.childrenStatus && persona.personalIncome,
+  );
+  const personaBasis = personaRequiredComplete
+    ? {
+        ageRange: persona.ageRange!,
+        maritalStatus: persona.maritalStatus!,
+        childrenStatus: persona.childrenStatus!,
+        personalIncome: persona.personalIncome!,
+      }
+    : null;
+  const personaBasisMatches = Boolean(
+    personaBasis &&
+      persona.classificationBasis &&
+      persona.classificationBasis.ageRange === personaBasis.ageRange &&
+      persona.classificationBasis.maritalStatus === personaBasis.maritalStatus &&
+      persona.classificationBasis.childrenStatus === personaBasis.childrenStatus &&
+      persona.classificationBasis.personalIncome === personaBasis.personalIncome,
+  );
+  const shouldPulseClassificationButton = personaRequiredComplete && (!persona.classification || !personaBasisMatches);
 
   const summary = useMemo(() => {
     const sections = state.parsed?.sections ?? [];
@@ -208,6 +236,10 @@ export default function ReviewPage() {
       const extractedMonthly = extractMonthlyPremiums(nextParsed);
       const extractedOverview = extractOverviewFields(nextParsed);
       setState((prev) => {
+        const nextCustomerName =
+          String(extractedOverview["客户姓名"] ?? "").trim() ||
+          String(nextParsed.meta.customerName ?? "").trim() ||
+          prev.persona.customerName;
         const prevMonthly = prev.cardMeta[monthlyMemoCardId]?.monthlyPremiums ?? [];
         const prevMonthlyByYm = new Map(
           prevMonthly.map((r) => [r.yearMonth, r.totalPremium] as const),
@@ -242,6 +274,7 @@ export default function ReviewPage() {
               monthlyPremiums: mergedMonthly,
             },
           },
+          persona: { ...prev.persona, customerName: nextCustomerName },
           updatedAt: Date.now(),
         };
       });
@@ -255,13 +288,6 @@ export default function ReviewPage() {
   function handleParseAndSave() {
     const input = textareaRef.current?.value ?? "";
     parseAndSave(input);
-  }
-
-  function handleClear() {
-    clear();
-    setExpandedById({});
-    setStatus("idle");
-    setErrorMessage(null);
   }
 
   function stopPolling() {
@@ -313,6 +339,9 @@ export default function ReviewPage() {
     try {
       const form = new FormData();
       form.set("file", selectedFile, selectedFile.name);
+      if (password.trim().length > 0) {
+        form.set("password", password.trim());
+      }
       const res = await fetch("/api/analyze", { method: "POST", body: form });
       if (!res.ok) {
         const contentType = res.headers.get("content-type") ?? "";
@@ -321,6 +350,29 @@ export default function ReviewPage() {
           contentType.includes("application/json") && raw.trim().length
             ? (JSON.parse(raw) as unknown)
             : null;
+        if (parsed && typeof parsed === "object") {
+          const rec = parsed as Record<string, unknown>;
+          const step = typeof rec.step === "string" ? rec.step : "";
+          const err = typeof rec.error === "object" && rec.error ? (rec.error as Record<string, unknown>) : null;
+          const code = err && typeof err.code === "string" ? err.code : "";
+          const msg = err && typeof err.msg === "string" ? err.msg : typeof rec.error === "string" ? rec.error : "";
+          const looksLikePasswordError =
+            step === "decrypt" &&
+            (code === "PDF_PASSWORD_INCORRECT" ||
+              msg.includes("密码错误") ||
+              msg.toLowerCase().includes("password"));
+          const looksLikePasswordRequired =
+            step === "decrypt" &&
+            (code === "PDF_PASSWORD_REQUIRED" || msg.includes("请输入查询密码"));
+          if (looksLikePasswordError) {
+            setToast("PDF 查询密码错误，请重新输入后再发送。");
+            return;
+          }
+          if (looksLikePasswordRequired) {
+            setToast("该 PDF 为加密文件，请先输入查询密码后再发送。");
+            return;
+          }
+        }
         const detail =
           parsed && typeof parsed === "object" && parsed
             ? (() => {
@@ -476,6 +528,114 @@ export default function ReviewPage() {
     }
   }
 
+  async function handlePreviewDecryptedPdf() {
+    if (!selectedFile || sending || previewingDecrypted) return;
+    setPreviewingDecrypted(true);
+    try {
+      const form = new FormData();
+      form.set("file", selectedFile, selectedFile.name);
+      if (password.trim().length > 0) {
+        form.set("password", password.trim());
+      }
+      const res = await fetch("/api/analyze?debug_download=true", {
+        method: "POST",
+        body: form,
+      });
+      if (!res.ok) {
+        const contentType = res.headers.get("content-type") ?? "";
+        const raw = await res.text();
+        const parsed =
+          contentType.includes("application/json") && raw.trim().length
+            ? (JSON.parse(raw) as unknown)
+            : null;
+        if (parsed && typeof parsed === "object") {
+          const rec = parsed as Record<string, unknown>;
+          const step = typeof rec.step === "string" ? rec.step : "";
+          const err =
+            typeof rec.error === "object" && rec.error
+              ? (rec.error as Record<string, unknown>)
+              : null;
+          const code = err && typeof err.code === "string" ? err.code : "";
+          const msg =
+            err && typeof err.msg === "string"
+              ? err.msg
+              : typeof rec.error === "string"
+                ? rec.error
+                : "";
+          const looksLikePasswordError =
+            step === "decrypt" &&
+            (code === "PDF_PASSWORD_INCORRECT" ||
+              msg.includes("密码错误") ||
+              msg.toLowerCase().includes("password"));
+          const looksLikePasswordRequired =
+            step === "decrypt" &&
+            (code === "PDF_PASSWORD_REQUIRED" || msg.includes("请输入查询密码"));
+          if (looksLikePasswordError) {
+            setToast("PDF 查询密码错误，请重新输入后再预览。");
+            return;
+          }
+          if (looksLikePasswordRequired) {
+            setToast("该 PDF 为加密文件，请先输入查询密码后再预览。");
+            return;
+          }
+        }
+        const detail =
+          parsed && typeof parsed === "object" && parsed
+            ? (() => {
+                const rec = parsed as Record<string, unknown>;
+                const step = typeof rec.step === "string" ? rec.step : "";
+                const msg =
+                  typeof rec.error === "string"
+                    ? rec.error
+                    : typeof rec.error === "object" && rec.error && "msg" in rec.error
+                      ? String((rec.error as Record<string, unknown>).msg ?? "")
+                      : "";
+                const status = res.status;
+                const text = [
+                  step ? `步骤:${step}` : "",
+                  msg ? `原因:${msg}` : "",
+                  `HTTP:${status}`,
+                ]
+                  .filter(Boolean)
+                  .join(" / ");
+                return text.length ? `（${text}）` : "";
+              })()
+            : `（HTTP:${res.status}）`;
+        setToast(`预览解密失败，请检查密码或稍后重试${detail}`);
+        return;
+      }
+
+      const contentType = res.headers.get("content-type") ?? "";
+      if (contentType.includes("application/json")) {
+        const raw = await res.text();
+        const parsed =
+          raw.trim().length > 0 ? (JSON.parse(raw) as unknown) : null;
+        const msg =
+          parsed && typeof parsed === "object" && parsed && "error" in parsed
+            ? String((parsed as Record<string, unknown>).error ?? "")
+            : "返回格式异常";
+        setToast(`预览解密失败：${msg}`);
+        return;
+      }
+
+      const blob = await res.blob();
+      const baseName = selectedFile.name.replace(/\.pdf$/i, "");
+      const filename = `${baseName}-decrypted.pdf`;
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.setTimeout(() => window.URL.revokeObjectURL(url), 1200);
+    } catch {
+      setToast("预览解密失败，请稍后重试");
+    } finally {
+      setPreviewingDecrypted(false);
+    }
+  }
+
   useEffect(() => {
     if (!toast) return;
     const t = window.setTimeout(() => setToast(null), 6000);
@@ -526,19 +686,52 @@ export default function ReviewPage() {
     }));
   }
 
-  function setOverviewField(key: string, value: string) {
-    setState((prev) => ({
-      ...prev,
-      cardMeta: {
-        ...prev.cardMeta,
-        [overviewCardId]: {
-          confirmed: Boolean(prev.cardMeta[overviewCardId]?.confirmed),
-          overviewFields: {
-            ...(prev.cardMeta[overviewCardId]?.overviewFields ?? {}),
-            [key]: value,
+  function setPolicyInsuranceType(id: string, insuranceType: InsuranceType | null) {
+    setState((prev) => {
+      const prevMeta = prev.cardMeta[id];
+      return {
+        ...prev,
+        cardMeta: {
+          ...prev.cardMeta,
+          [id]: {
+            ...prevMeta,
+            confirmed: Boolean(prevMeta?.confirmed),
+            reportSource: prevMeta?.reportSource,
+            insuranceType: insuranceType ?? undefined,
           },
         },
-      },
+        updatedAt: Date.now(),
+      };
+    });
+  }
+
+  function setOverviewField(key: string, value: string) {
+    setState((prev) => {
+      const next = {
+        ...prev,
+        cardMeta: {
+          ...prev.cardMeta,
+          [overviewCardId]: {
+            confirmed: Boolean(prev.cardMeta[overviewCardId]?.confirmed),
+            overviewFields: {
+              ...(prev.cardMeta[overviewCardId]?.overviewFields ?? {}),
+              [key]: value,
+            },
+          },
+        },
+        updatedAt: Date.now(),
+      };
+      if (key === "客户姓名") {
+        return { ...next, persona: { ...prev.persona, customerName: value } };
+      }
+      return next;
+    });
+  }
+
+  function setPersonaField<K extends keyof typeof persona>(key: K, value: (typeof persona)[K]) {
+    setState((prev) => ({
+      ...prev,
+      persona: { ...prev.persona, [key]: value },
       updatedAt: Date.now(),
     }));
   }
@@ -619,57 +812,12 @@ export default function ReviewPage() {
     <div className="space-y-6">
       <div className="space-y-2">
         <h1 className="text-xl font-semibold tracking-tight">校对工作台</h1>
-        <p className="text-sm text-zinc-600">
-          这里将接收 Coze 输出的 Markdown，并渲染成可编辑表格供点选确认与修改。
-        </p>
       </div>
 
       <div className="space-y-3 rounded-xl border border-zinc-200 bg-white p-4">
-        <div className="space-y-1">
-          <div className="text-sm font-medium">Coze端捕获原文</div>
-          <div className="text-xs text-zinc-500">
-            将 Coze 端捕获到的原始返回粘贴到这里，点击数据清洗后会自动解包、反转义并裁剪为标准 Markdown。
-          </div>
-        </div>
+        <div className="text-sm font-semibold">第1步，摘录与解析《银保报告》关键信息</div>
 
-        <textarea
-          value={capturedRaw}
-          disabled={sending}
-          onChange={(e) => setCapturedRaw(e.target.value)}
-          className={[
-            "h-48 w-full resize-y rounded-lg border px-3 py-2 text-sm outline-none",
-            sending
-              ? "cursor-wait border-zinc-200 bg-zinc-100 text-zinc-600"
-              : "border-zinc-200 bg-white focus:border-zinc-400",
-          ].join(" ")}
-          placeholder="粘贴 Coze 端捕获原文到这里..."
-        />
-
-        <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={handleCleanCapturedRaw}
-            disabled={sending || capturedRaw.trim().length === 0}
-            className={[
-              "inline-flex h-9 items-center justify-center rounded-lg px-3 text-sm font-medium",
-              sending || capturedRaw.trim().length === 0
-                ? "cursor-not-allowed bg-zinc-200 text-zinc-600"
-                : "bg-zinc-900 text-white hover:bg-zinc-800",
-            ].join(" ")}
-          >
-            数据清洗
-          </button>
-        </div>
-
-        <div className="border-t border-zinc-200" />
-
-        <div className="space-y-1">
-          <div className="text-sm font-medium">Markdown 输入</div>
-          <div className="text-xs text-zinc-500">
-            粘贴 Coze 输出的 Markdown（包含多个标题与表格），点击解析后会写入本地存储。
-          </div>
-        </div>
-
+        <div className="text-xs font-medium text-zinc-700">1.1 将银保报告发给AI</div>
         <div className="flex items-center justify-between gap-3">
           <div className="flex min-w-0 items-center gap-2">
             <input
@@ -680,6 +828,7 @@ export default function ReviewPage() {
               onChange={(e) => {
                 const file = e.target.files?.[0] ?? null;
                 setSelectedFile(file);
+                setPassword("");
                 setStatus("idle");
                 setErrorMessage(null);
               }}
@@ -702,6 +851,40 @@ export default function ReviewPage() {
               {selectedFile ? selectedFile.name : "未选择文件"}
             </div>
           </div>
+
+          {selectedFile ? (
+            <div className="flex items-center gap-2">
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                disabled={sending || previewingDecrypted}
+                placeholder="若 PDF 是加密文件，请输入查询密码；若PDF没有加密，直接点击发送按钮即可"
+                className={[
+                  "h-9 w-[min(23vw,210px)] rounded-lg border px-3 text-sm outline-none",
+                  sending || previewingDecrypted
+                    ? "cursor-wait border-zinc-200 bg-zinc-100 text-zinc-600"
+                    : "border-zinc-200 bg-white focus:border-zinc-400",
+                ].join(" ")}
+              />
+              <button
+                type="button"
+                onClick={handlePreviewDecryptedPdf}
+                disabled={sending || previewingDecrypted}
+                className={[
+                  "inline-flex h-9 items-center justify-center gap-2 rounded-lg border px-3 text-sm font-medium",
+                  sending || previewingDecrypted
+                    ? "cursor-wait border-zinc-200 bg-zinc-100 text-zinc-600"
+                    : "border-zinc-200 bg-white text-zinc-900 hover:bg-zinc-50",
+                ].join(" ")}
+              >
+                {previewingDecrypted ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : null}
+                预览解密版PDF
+              </button>
+            </div>
+          ) : null}
 
           <button
             type="button"
@@ -731,6 +914,41 @@ export default function ReviewPage() {
           </div>
         ) : null}
 
+        <div className="border-t border-zinc-200" />
+
+        <div className="text-xs font-medium text-zinc-700">1.2 清洗AI返回原始数据</div>
+        <textarea
+          value={capturedRaw}
+          disabled={sending}
+          onChange={(e) => setCapturedRaw(e.target.value)}
+          className={[
+            "h-48 w-full resize-y rounded-lg border px-3 py-2 text-sm outline-none",
+            sending
+              ? "cursor-wait border-zinc-200 bg-zinc-100 text-zinc-600"
+              : "border-zinc-200 bg-white focus:border-zinc-400",
+          ].join(" ")}
+          placeholder="等待AI自动返回《银保报告》的摘录信息"
+        />
+
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={handleCleanCapturedRaw}
+            disabled={sending || capturedRaw.trim().length === 0}
+            className={[
+              "inline-flex h-9 items-center justify-center rounded-lg px-3 text-sm font-medium",
+              sending || capturedRaw.trim().length === 0
+                ? "cursor-not-allowed bg-zinc-200 text-zinc-600"
+                : "bg-zinc-900 text-white hover:bg-zinc-800",
+            ].join(" ")}
+          >
+            数据清洗
+          </button>
+        </div>
+
+        <div className="border-t border-zinc-200" />
+
+        <div className="text-xs font-medium text-zinc-700">1.3 解析《银保报告》摘录信息</div>
         <textarea
           key={state.updatedAt ?? 0}
           ref={textareaRef}
@@ -746,7 +964,7 @@ export default function ReviewPage() {
               ? "cursor-wait border-zinc-200 bg-zinc-100 text-zinc-600"
               : "border-zinc-200 bg-white focus:border-zinc-400",
           ].join(" ")}
-          placeholder="粘贴 Markdown 字符串到这里..."
+          placeholder="等待清洗数据流入"
         />
 
         <div className="flex flex-wrap items-center gap-2">
@@ -762,19 +980,6 @@ export default function ReviewPage() {
             ].join(" ")}
           >
             解析并保存
-          </button>
-          <button
-            type="button"
-            onClick={handleClear}
-            disabled={sending}
-            className={[
-              "inline-flex h-9 items-center justify-center rounded-lg border px-3 text-sm font-medium",
-              sending
-                ? "cursor-wait border-zinc-200 bg-zinc-100 text-zinc-600"
-                : "border-zinc-200 bg-white text-zinc-900 hover:bg-zinc-50",
-            ].join(" ")}
-          >
-            清空本地数据
           </button>
 
           <div className="ml-auto text-xs text-zinc-500">
@@ -796,6 +1001,158 @@ export default function ReviewPage() {
             {errorMessage ?? "解析失败"}
           </div>
         ) : null}
+      </div>
+
+      <div className="rounded-xl border border-zinc-200 bg-white p-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="space-y-1">
+            <div className="text-sm font-semibold">第2步，完善客户画像</div>
+            <div className="text-xs text-zinc-500">用于保障评级（本地保存，刷新页面不丢失）</div>
+          </div>
+          <div className="flex items-center gap-2">
+            {persona.classification ? (
+              <span className={getClassificationPillClasses(persona.classification.id)}>
+                {persona.classification.label}
+              </span>
+            ) : null}
+            <button
+              type="button"
+              disabled={sending || !personaRequiredComplete}
+              onClick={async () => {
+                if (!personaRequiredComplete || !personaBasis) return;
+                const classification = classifyPersona(persona);
+                if (!classification) {
+                  setToast("当前画像未匹配到分类标签，请检查必填项选择");
+                  return;
+                }
+                setState((prev) => ({
+                  ...prev,
+                  persona: {
+                    ...prev.persona,
+                    classification,
+                    classificationBasis: personaBasis,
+                  },
+                  updatedAt: Date.now(),
+                }));
+                console.log("[标签更新] classification", classification);
+                const confirmedRows = getConfirmedPolicyRows(state.parsed, state.cardMeta);
+                const scoreResult = computeProtectionScore({
+                  persona: { ...persona, classification, classificationBasis: personaBasis },
+                  parsed: state.parsed,
+                  confirmedPolicies: confirmedRows.map((r) => r.row),
+                });
+                if (scoreResult) {
+                  await updateCaseScore(scoreResult.score, scoreResult.ratingLabel);
+                }
+              }}
+              className={[
+                "inline-flex h-9 items-center justify-center rounded-lg px-3 text-sm font-medium transition",
+                sending || !personaRequiredComplete
+                  ? "cursor-not-allowed bg-zinc-200 text-zinc-600"
+                  : "bg-[#D31145] text-white hover:bg-[#b50f3a]",
+                !sending && shouldPulseClassificationButton ? "animate-pulse" : "",
+              ].join(" ")}
+            >
+              写入分类标签
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+          <div className="space-y-1">
+            <div className="text-xs text-zinc-500">客户姓名</div>
+            <input
+              value={persona.customerName}
+              disabled
+              className="h-10 w-full rounded-lg border border-zinc-200 bg-zinc-100 px-3 text-sm text-zinc-700 outline-none"
+            />
+          </div>
+
+          <div className="space-y-1">
+            <div className="text-xs text-zinc-500">年龄（必填）</div>
+            <select
+              value={persona.ageRange ?? ""}
+              disabled={sending}
+              onChange={(e) => setPersonaField("ageRange", (e.target.value || null) as typeof persona.ageRange)}
+              className="h-10 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400"
+            >
+              <option value="">请选择</option>
+              {(["0~18", "19~30", "25~35", "31~50", "50以上"] as const).map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="space-y-1">
+            <div className="text-xs text-zinc-500">婚否（必填）</div>
+            <select
+              value={persona.maritalStatus ?? ""}
+              disabled={sending}
+              onChange={(e) =>
+                setPersonaField("maritalStatus", (e.target.value || null) as typeof persona.maritalStatus)
+              }
+              className="h-10 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400"
+            >
+              <option value="">请选择</option>
+              {(["已婚", "未婚"] as const).map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="space-y-1">
+            <div className="text-xs text-zinc-500">子女（必填）</div>
+            <select
+              value={persona.childrenStatus ?? ""}
+              disabled={sending}
+              onChange={(e) =>
+                setPersonaField("childrenStatus", (e.target.value || null) as typeof persona.childrenStatus)
+              }
+              className="h-10 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400"
+            >
+              <option value="">请选择</option>
+              {(["有孩", "无孩"] as const).map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="space-y-1 sm:col-span-2">
+            <div className="text-xs text-zinc-500">个人收入（必填）</div>
+            <select
+              value={persona.personalIncome ?? ""}
+              disabled={sending}
+              onChange={(e) =>
+                setPersonaField("personalIncome", (e.target.value || null) as typeof persona.personalIncome)
+              }
+              className="h-10 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm outline-none focus:border-zinc-400"
+            >
+              <option value="">请选择</option>
+              {(["10万以下", "10~20万", "20~50万", "50~100万", "100万以上"] as const).map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="space-y-1 sm:col-span-2">
+            <div className="text-xs text-zinc-500">其他信息（可选）</div>
+            <textarea
+              value={persona.otherInfo}
+              disabled={sending}
+              onChange={(e) => setPersonaField("otherInfo", e.target.value)}
+              className="h-28 w-full resize-y rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm outline-none focus:border-zinc-400"
+              placeholder="输入客户背景、职业、健康状态、风险偏好等..."
+            />
+          </div>
+        </div>
       </div>
 
       {toast ? (
@@ -822,7 +1179,7 @@ export default function ReviewPage() {
 
       <div ref={workspaceRef} className="space-y-3">
         <div className="flex flex-wrap items-center gap-2">
-          <div className="text-sm font-medium">保单卡片</div>
+          <div className="text-sm font-medium">第3步，检查修正解析后的关键信息</div>
           <button
             type="button"
             onClick={confirmAllVisible}
@@ -875,7 +1232,7 @@ export default function ReviewPage() {
         >
           <div className="flex flex-wrap items-start justify-between gap-3 px-4 py-4">
             <div className="space-y-1">
-              <div className="text-sm font-semibold">汇总统计（Coze）</div>
+              <div className="text-sm font-semibold">汇总统计</div>
               <div className="text-xs text-zinc-500">
                 可编辑，确认后将用于家庭保障总览展示
               </div>
@@ -914,7 +1271,7 @@ export default function ReviewPage() {
 
         {policyCards.length === 0 ? (
           <div className="rounded-xl border border-dashed border-zinc-300 bg-white p-6 text-sm text-zinc-600">
-            暂未识别到“保单信息”表格。请先在上方粘贴 Markdown 并解析保存。
+            暂未识别到“保单信息”
           </div>
         ) : (
           <div className="grid gap-3">
@@ -941,8 +1298,40 @@ export default function ReviewPage() {
                     className="flex w-full items-start gap-3 px-4 py-4 text-left active:bg-zinc-50"
                   >
                     <div className="min-w-0 flex-1">
-                      <div className="truncate text-sm font-semibold">
-                        {product}
+                      <div className="flex min-w-0 flex-wrap items-center gap-2">
+                        <div className="min-w-0 truncate text-sm font-semibold">
+                          {product}
+                        </div>
+                        {(() => {
+                          const stored = state.cardMeta[card.id]?.insuranceType;
+                          const storedValid =
+                            stored && insuranceTypeOptions.includes(stored as InsuranceType)
+                              ? stored
+                              : undefined;
+                          const inferred = inferInsuranceType(product)?.type;
+                          const value = storedValid ?? inferred ?? "";
+                          return (
+                            <select
+                              value={value}
+                              onClick={(e) => e.stopPropagation()}
+                              onChange={(e) => {
+                                const next = e.target.value as InsuranceType | "";
+                                setPolicyInsuranceType(card.id, next ? next : null);
+                              }}
+                              className={[
+                                "h-7 rounded-full border px-2 text-xs font-medium outline-none",
+                                "border-zinc-200 bg-white text-zinc-700",
+                              ].join(" ")}
+                            >
+                              <option value="">请选择</option>
+                              {insuranceTypeOptions.map((t) => (
+                                <option key={t} value={t}>
+                                  {t}
+                                </option>
+                              ))}
+                            </select>
+                          );
+                        })()}
                       </div>
                       <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-zinc-600">
                         <div className="min-h-5">
@@ -1064,20 +1453,39 @@ export default function ReviewPage() {
           </div>
         ) : (
           <div className="mt-4 rounded-lg bg-zinc-50 px-3 py-2 text-sm text-zinc-600">
-            暂未解析到“月度交费备忘录”表格。请重新粘贴包含该区块的 Markdown 后解析保存。
+            暂未解析到“月度交费备忘录”
           </div>
         )}
       </div>
 
       <div className="pt-2">
         {confirmStats.confirmed > 0 ? (
-          <Link
-            href="/summary"
+          <button
+            type="button"
+            onClick={async () => {
+              const basis =
+                personaRequiredComplete && personaBasis
+                  ? personaBasis
+                  : persona.classificationBasis;
+              const classification = persona.classification ?? (personaRequiredComplete ? classifyPersona(persona) : null);
+              if (classification && basis) {
+                const confirmedRows = getConfirmedPolicyRows(state.parsed, state.cardMeta);
+                const scoreResult = computeProtectionScore({
+                  persona: { ...persona, classification, classificationBasis: basis },
+                  parsed: state.parsed,
+                  confirmedPolicies: confirmedRows.map((r) => r.row),
+                });
+                if (scoreResult) {
+                  await updateCaseScore(scoreResult.score, scoreResult.ratingLabel);
+                }
+              }
+              router.push("/summary");
+            }}
             className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-zinc-900 px-4 text-sm font-semibold text-white hover:bg-zinc-800"
           >
             确认无误，生成家庭汇总
             <ArrowRight className="h-4 w-4" />
-          </Link>
+          </button>
         ) : (
           <button
             type="button"

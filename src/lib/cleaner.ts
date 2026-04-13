@@ -16,15 +16,28 @@ function sanitizeMarkdownText(input: string) {
 }
 
 function unescapeCapturedText(input: string) {
-  return input
-    .replace(/\\\\r\\\\n/g, "\n")
-    .replace(/\\r\\n/g, "\n")
-    .replace(/\\\\n/g, "\n")
-    .replace(/\\n/g, "\n")
-    .replace(/\\r/g, "\n")
-    .replace(/\\"/g, "\"")
-    .replace(/\\\\/g, "\\")
-    .replace(/\\u([0-9a-fA-F]{4})/g, (_, code: string) => String.fromCharCode(Number.parseInt(code, 16)));
+  let out = input;
+  for (let i = 0; i < 6; i += 1) {
+    const next = out
+      .replace(/\\\\r\\\\n/g, "\n")
+      .replace(/\\r\\n/g, "\n")
+      .replace(/\\\\n/g, "\n")
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "\n")
+      .replace(/\\"/g, "\"")
+      .replace(/\\\\/g, "\\");
+    if (next === out) break;
+    out = next;
+  }
+  for (let i = 0; i < 4; i += 1) {
+    const next = out.replace(
+      /\\u([0-9a-fA-F]{4})/g,
+      (_, code: string) => String.fromCharCode(Number.parseInt(code, 16)),
+    );
+    if (next === out) break;
+    out = next;
+  }
+  return out;
 }
 
 function normalizeForMatch(input: string) {
@@ -40,10 +53,23 @@ function normalizeSectionHeading(rawHeading: string) {
   if (/保单概览/.test(heading)) return "## 保单概览统计信息";
   if (/被保人视图/.test(heading)) return "## 被保人视图保单清单";
   if (/投保人视图/.test(heading)) return "## 投保人视图保单清单";
-  if (/保障责任.*汇总|汇总.*保障责任/.test(heading)) return "## 保障责任汇总";
+  if (/保障责任/.test(heading) && /精读|三级/.test(heading)) return "## 保障责任精读汇总";
+  if (/保障责任/.test(heading) && /汇总/.test(heading) && !/精读/.test(heading)) return "## 保障责任汇总";
   if (/月度.*交费|交费.*月度/.test(heading)) return "## 月度交费备忘录";
-  if (/保障责任精读/.test(heading)) return "## 保障责任精读汇总";
   return null;
+}
+
+function trimJsonDebris(text: string) {
+  const lines = text.replace(/\u0000/g, "").split("\n");
+  const cleaned = lines.map((raw) => {
+    let line = raw;
+    const idxBrace = line.search(/\|\s*"\}/);
+    if (idxBrace >= 0) line = `${line.slice(0, idxBrace + 1).trimEnd()}`;
+    const idxBracket = line.search(/\|\s*"\]/);
+    if (idxBracket >= 0) line = `${line.slice(0, idxBracket + 1).trimEnd()}`;
+    return line;
+  });
+  return cleaned.join("\n").replace(/[\s\r\n]*["\}\],]+[\s\r\n]*$/g, "").trim();
 }
 
 function pickFromMessageList(payload: unknown) {
@@ -113,6 +139,18 @@ function scanSections(text: string) {
   const lines = source.split("\n");
   const blocks = new Map<string, SectionBlock>();
   const orderedHeadings: string[] = [];
+  const cleanTableLine = (raw: string) => {
+    let row = raw.trim();
+    if (!row) return null;
+    if (!row.startsWith("|")) return null;
+    const idxBrace = row.search(/\|\s*"\}/);
+    if (idxBrace >= 0) row = row.slice(0, idxBrace + 1).trimEnd();
+    const idxBracket = row.search(/\|\s*"\]/);
+    if (idxBracket >= 0) row = row.slice(0, idxBracket + 1).trimEnd();
+    if (!row.endsWith("|")) return null;
+    if (/[}\]"]\s*\|\s*$/.test(row)) return null;
+    return row;
+  };
   let i = 0;
   while (i < lines.length) {
     const line = lines[i] ?? "";
@@ -130,14 +168,8 @@ function scanSections(text: string) {
     if (!normalizedHeading) continue;
     const blockLines = lines.slice(start, i);
     const tableLines = blockLines
-      .map((row) => row.trim())
-      .filter((row) => row.includes("|"))
-      .map((row) => {
-        let next = row;
-        if (!next.startsWith("|")) next = `| ${next}`;
-        if (!next.endsWith("|")) next = `${next} |`;
-        return next;
-      });
+      .map((row) => cleanTableLine(row))
+      .filter((row): row is string => typeof row === "string");
     if (!tableLines.length) continue;
     const existing = blocks.get(normalizedHeading);
     if (!existing || tableLines.join("\n").length > existing.lines.join("\n").length) {
@@ -184,7 +216,7 @@ export function cleanInsuranceData(input: unknown): CleanInsuranceResult | null 
   let bestHasPolicyTable = false;
 
   for (const candidate of candidates) {
-    const text = sanitizeMarkdownText(unescapeCapturedText(candidate)).replace(/\r\n?/g, "\n");
+    const text = trimJsonDebris(sanitizeMarkdownText(unescapeCapturedText(candidate))).replace(/\r\n?/g, "\n");
     const top = extractTopFields(text);
     const sections = scanSections(text);
     const sectionNames = sections.map((s) => s.heading.replace(/^##\s*/, ""));

@@ -12,10 +12,10 @@ type NavItem = {
 };
 
 const navItems: NavItem[] = [
-  { href: "/", label: "Dashboard", icon: LayoutDashboard },
+  { href: "/", label: "案卷管理", icon: LayoutDashboard },
   { href: "/review", label: "校对工作台", icon: ClipboardCheck },
   { href: "/summary", label: "家庭保障全景", icon: Shield },
-  { href: "/report", label: "报告预览", icon: FileText },
+  { href: "/report", label: "解读报告", icon: FileText },
 ];
 
 function isActivePath(pathname: string, href: string) {

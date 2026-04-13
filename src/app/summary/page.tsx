@@ -1,10 +1,14 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useCaseContext } from "@/context/CaseContext";
 import { getConfirmedPolicyRows } from "@/lib/reviewConfirmedPolicies";
 import { aggregateHouseholdModel } from "@/lib/aggregator";
+import { buildClientDataJson, buildReportSnapshot } from "@/lib/reportGenerator";
+import { computeProtectionScoreDetails } from "@/lib/scoringEngine";
+import type { ReportStrategy } from "@/lib/db";
 import {
   ArrowLeft,
   FileText,
@@ -317,13 +321,12 @@ function MonthlyMemoBarChart({
   return <div ref={containerRef} className="h-[320px] w-full" />;
 }
 
-type AccountKey = "healthCritical" | "healthMedical" | "lifeDeath" | "wealth";
+type AccountKey = "health" | "life" | "wealth";
 
 function getAccountLabel(account: AccountKey) {
-  if (account === "healthCritical") return "健康账户（重疾）";
-  if (account === "healthMedical") return "健康账户（医疗）";
-  if (account === "lifeDeath") return "生命账户（身故）";
-  return "财富账户（已交保费）";
+  if (account === "health") return "健康账户";
+  if (account === "life") return "生命账户";
+  return "财富账户";
 }
 
 const overviewCardId = "overview:stats";
@@ -345,7 +348,8 @@ const overviewKeyGroup2 = [
 const monthlyMemoCardId = "memo:monthlyPremiums";
 
 export default function SummaryPage() {
-  const { state } = useCaseContext();
+  const { state, updateCaseReportDraft, updateCaseScore } = useCaseContext();
+  const router = useRouter();
   const [hidePending, setHidePending] = useState(false);
   const [drawer, setDrawer] = useState<{ insuredName: string; account: AccountKey } | null>(
     null,
@@ -354,6 +358,12 @@ export default function SummaryPage() {
   const [reportLoading, setReportLoading] = useState(false);
   const [relayoutLoading, setRelayoutLoading] = useState(false);
   const [expandedMembers, setExpandedMembers] = useState<Record<string, boolean>>({});
+  const [debugDialog, setDebugDialog] = useState<
+    null | { jsonText: string; strategy: ReportStrategy; clientDataJson: unknown }
+  >(null);
+  const [debugCopied, setDebugCopied] = useState(false);
+  const [debugForceEnabled, setDebugForceEnabled] = useState(false);
+  const debugClickRef = useRef<{ count: number; lastAt: number }>({ count: 0, lastAt: 0 });
 
   const confirmedRows = useMemo(() => {
     return getConfirmedPolicyRows(state.parsed, state.cardMeta);
@@ -410,13 +420,64 @@ export default function SummaryPage() {
     setDrawer(null);
   }
 
-  function startMockLoading(kind: "report" | "relayout") {
-    if (kind === "report") {
-      if (reportLoading) return;
-      setReportLoading(true);
-      window.setTimeout(() => setReportLoading(false), 1200);
-      return;
+  async function runInterpretAndGo(strategy: ReportStrategy, clientDataJson: unknown) {
+    await updateCaseReportDraft({
+      strategy,
+      clientDataJson,
+      markdown: "",
+      generatedAt: Date.now(),
+      job: null,
+    });
+    router.push("/report?loading=true");
+  }
+
+  async function handleGenerateInitialReport(strategy: ReportStrategy = "professional_premium") {
+    if (reportLoading) return;
+    setReportLoading(true);
+    try {
+      const confirmedPolicies = confirmedRows.map((r) => r.row);
+      const details = computeProtectionScoreDetails({
+        persona: state.persona,
+        parsed: state.parsed,
+        confirmedPolicies,
+      });
+      if (details) {
+        await updateCaseScore(details.score, details.ratingLabel);
+      }
+      const snapshot = buildReportSnapshot({
+        persona: state.persona,
+        ratingLabel: details?.ratingLabel ?? null,
+        totalScore: details?.score ?? 0,
+        scoringAccounts: details?.accounts ?? [
+          { account: "健康账户", score: 0, maxScore: 0, missingScore: 0, gaps: [] },
+          { account: "生命账户", score: 0, maxScore: 0, missingScore: 0, gaps: [] },
+          { account: "财富账户", score: 0, maxScore: 0, missingScore: 0, gaps: [] },
+        ],
+        scoringItems: details?.items ?? [],
+        confirmedPolicyRows: confirmedRows.map((r) => ({ id: r.id, row: r.row })),
+      });
+      const clientDataJson = buildClientDataJson({ strategy, snapshot });
+
+      const shouldDebug = debugForceEnabled;
+      if (shouldDebug) {
+        setDebugCopied(false);
+        setDebugDialog({
+          jsonText: JSON.stringify(clientDataJson, null, 2),
+          strategy,
+          clientDataJson,
+        });
+        return;
+      }
+
+      await runInterpretAndGo(strategy, clientDataJson);
+    } catch (err) {
+      console.error("[summary] interpret failed", err);
+    } finally {
+      setReportLoading(false);
     }
+  }
+
+  function startMockRelayout() {
     if (relayoutLoading) return;
     setRelayoutLoading(true);
     window.setTimeout(() => setRelayoutLoading(false), 1200);
@@ -426,24 +487,16 @@ export default function SummaryPage() {
     ? members.find((m) => m.insuredName === drawer.insuredName) ?? null
     : null;
 
-  const drawerLevel2Details =
-    drawerMember && drawer && drawerMember.status === "active" && drawer.account !== "wealth"
-      ? drawer.account === "healthCritical"
-        ? drawerMember.accounts.healthCritical.level2Details
-        : drawer.account === "healthMedical"
-          ? drawerMember.accounts.healthMedical.level2Details
-          : drawerMember.accounts.lifeDeath.level2Details
-      : [];
-
   const drawerPolicies =
     drawerMember && drawer
-      ? drawer.account === "healthCritical"
-        ? drawerMember.accounts.healthCritical.policies
-        : drawer.account === "healthMedical"
-          ? drawerMember.accounts.healthMedical.policies
-          : drawer.account === "lifeDeath"
-            ? drawerMember.accounts.lifeDeath.policies
-            : drawerMember.accounts.wealth.policies
+      ? drawer.account === "health"
+        ? [
+            ...drawerMember.accounts.healthCritical.policies,
+            ...drawerMember.accounts.healthMedical.policies,
+          ]
+        : drawer.account === "life"
+          ? drawerMember.accounts.lifeDeath.policies
+          : drawerMember.accounts.wealth.policies
       : [];
 
   return (
@@ -453,7 +506,7 @@ export default function SummaryPage() {
         <div className="space-y-1">
           <h1 className="text-xl font-semibold tracking-tight">家庭保障全景</h1>
           <div className="text-xs text-zinc-500">
-            汇总基于“已确认保单”，并按被保人聚合至四大保障账户。
+            汇总基于“已确认保单”，并按被保人聚合至三大保障账户。
           </div>
         </div>
         <Link
@@ -504,7 +557,21 @@ export default function SummaryPage() {
           <div className="text-sm font-medium">家庭保障总览</div>
           <div className="text-xs text-zinc-500">
             {overviewConfirmed ? "已确认" : "未确认"} ·{" "}
-            {overviewFields["客户姓名"] || summary.customerName || "主客户"}
+            <span
+              className="cursor-pointer select-none"
+              onClick={() => {
+                const now = Date.now();
+                const lastAt = debugClickRef.current.lastAt;
+                const nextCount = now - lastAt <= 900 ? debugClickRef.current.count + 1 : 1;
+                debugClickRef.current = { count: nextCount, lastAt: now };
+                if (nextCount >= 5) {
+                  setDebugForceEnabled(true);
+                  debugClickRef.current = { count: 0, lastAt: 0 };
+                }
+              }}
+            >
+              {overviewFields["客户姓名"] || summary.customerName || "主客户"}
+            </span>
           </div>
         </div>
 
@@ -560,6 +627,12 @@ export default function SummaryPage() {
 
             const roleLabel = m.role === "self" ? "本人" : "家人";
             const expanded = Boolean(expandedMembers[m.insuredName]);
+            const hasGroupPolicy = [
+              ...m.accounts.healthCritical.policies,
+              ...m.accounts.healthMedical.policies,
+              ...m.accounts.lifeDeath.policies,
+              ...m.accounts.wealth.policies,
+            ].some((p) => p.policyName.includes("团体"));
 
             return (
               <div
@@ -591,6 +664,11 @@ export default function SummaryPage() {
                     ) : (
                       <div className="mt-1 text-xs text-zinc-500">
                         已确认 {m.policyCount} 份保单（含附加险）
+                        {hasGroupPolicy ? (
+                          <span className="ml-2 font-medium text-rose-600">
+                            团体险额度待查
+                          </span>
+                        ) : null}
                       </div>
                     )}
                   </div>
@@ -633,107 +711,68 @@ export default function SummaryPage() {
                 <div className="mt-4 grid gap-3">
                   <button
                     type="button"
-                    onClick={() => openDrawer(m.insuredName, "healthCritical")}
+                    onClick={() => openDrawer(m.insuredName, "health")}
                     className="rounded-xl border border-zinc-200 bg-white p-3 text-left transition-colors hover:bg-zinc-50"
                   >
                     <div className="flex items-start justify-between gap-3">
                       <div className="text-xs font-medium text-zinc-700">
-                        健康账户（重疾）
+                        健康账户
                       </div>
-                      <div className="text-sm font-semibold tabular-nums">
-                        {formatNumber(m.accounts.healthCritical.mainAmount)}
-                      </div>
+                      <div className="text-xs text-zinc-500">点击查看明细</div>
                     </div>
-                    <div className="mt-1 text-[11px] text-zinc-500">
-                      含中症/轻症：{formatNumber(m.accounts.healthCritical.middleAmount)} /{" "}
-                      {formatNumber(m.accounts.healthCritical.lightAmount)}
-                    </div>
-                    <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-zinc-100">
-                      <div
-                        className="h-full rounded-full bg-emerald-500 transition-[width]"
-                        style={{
-                          width: `${percent(
-                            m.accounts.healthCritical.mainAmount,
-                            maxByAccount.maxHealthCritical,
-                          )}%`,
-                        }}
-                      />
-                    </div>
-                    {expanded &&
-                    m.status === "active" &&
-                    m.accounts.healthCritical.level2Details.length > 0 ? (
-                      <div className="mt-3 space-y-2">
-                        <div className="text-[11px] font-medium text-zinc-700">
-                          二级保障明细
+                    <div className="mt-2 space-y-3">
+                      <div>
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="text-[11px] font-medium text-zinc-700">
+                            重疾
+                          </div>
+                          <div className="text-sm font-semibold tabular-nums">
+                            {formatNumber(m.accounts.healthCritical.mainAmount)}
+                          </div>
                         </div>
-                        <div className="space-y-1">
-                          {m.accounts.healthCritical.level2Details.map((d) => (
-                            <div
-                              key={d.name}
-                              className="flex items-center justify-between gap-3 text-[11px] text-zinc-600"
-                            >
-                              <div className="min-w-0 truncate">{d.name}</div>
-                              <div className="shrink-0 tabular-nums">
-                                {formatNumber(d.amount)}
-                              </div>
-                            </div>
-                          ))}
+                        <div className="mt-1 text-[11px] text-zinc-500">
+                          含中症/轻症：{formatNumber(m.accounts.healthCritical.middleAmount)} /{" "}
+                          {formatNumber(m.accounts.healthCritical.lightAmount)}
+                        </div>
+                        <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-zinc-100">
+                          <div
+                            className="h-full rounded-full bg-emerald-500 transition-[width]"
+                            style={{
+                              width: `${percent(
+                                m.accounts.healthCritical.mainAmount,
+                                maxByAccount.maxHealthCritical,
+                              )}%`,
+                            }}
+                          />
                         </div>
                       </div>
-                    ) : null}
+                      <div>
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="text-[11px] font-medium text-zinc-700">
+                            医疗
+                          </div>
+                          <div className="text-sm font-semibold tabular-nums">
+                            {formatNumber(m.accounts.healthMedical.annualLimit)}
+                          </div>
+                        </div>
+                        <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-zinc-100">
+                          <div
+                            className="h-full rounded-full bg-sky-500 transition-[width]"
+                            style={{
+                              width: `${percent(
+                                m.accounts.healthMedical.annualLimit,
+                                maxByAccount.maxHealthMedical,
+                              )}%`,
+                            }}
+                          />
+                        </div>
+                      </div>
+                    </div>
                   </button>
 
                   <button
                     type="button"
-                    onClick={() => openDrawer(m.insuredName, "healthMedical")}
-                    className="rounded-xl border border-zinc-200 bg-white p-3 text-left transition-colors hover:bg-zinc-50"
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="text-xs font-medium text-zinc-700">
-                        健康账户（医疗）
-                      </div>
-                      <div className="text-sm font-semibold tabular-nums">
-                        {formatNumber(m.accounts.healthMedical.annualLimit)}
-                      </div>
-                    </div>
-                    <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-zinc-100">
-                      <div
-                        className="h-full rounded-full bg-sky-500 transition-[width]"
-                        style={{
-                          width: `${percent(
-                            m.accounts.healthMedical.annualLimit,
-                            maxByAccount.maxHealthMedical,
-                          )}%`,
-                        }}
-                      />
-                    </div>
-                    {expanded &&
-                    m.status === "active" &&
-                    m.accounts.healthMedical.level2Details.length > 0 ? (
-                      <div className="mt-3 space-y-2">
-                        <div className="text-[11px] font-medium text-zinc-700">
-                          二级保障明细
-                        </div>
-                        <div className="space-y-1">
-                          {m.accounts.healthMedical.level2Details.map((d) => (
-                            <div
-                              key={d.name}
-                              className="flex items-center justify-between gap-3 text-[11px] text-zinc-600"
-                            >
-                              <div className="min-w-0 truncate">{d.name}</div>
-                              <div className="shrink-0 tabular-nums">
-                                {formatNumber(d.amount)}
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    ) : null}
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => openDrawer(m.insuredName, "lifeDeath")}
+                    onClick={() => openDrawer(m.insuredName, "life")}
                     className="rounded-xl border border-zinc-200 bg-white p-3 text-left transition-colors hover:bg-zinc-50"
                   >
                     <div className="flex items-start justify-between gap-3">
@@ -841,13 +880,13 @@ export default function SummaryPage() {
       <div className="grid gap-2 pt-2 sm:grid-cols-2">
         <button
           type="button"
-          onClick={() => startMockLoading("report")}
+          onClick={() => handleGenerateInitialReport("professional_premium")}
           disabled={reportLoading}
           className={[
             "inline-flex h-12 w-full items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold",
             reportLoading
               ? "cursor-wait bg-zinc-200 text-zinc-600"
-              : "bg-zinc-900 text-white hover:bg-zinc-800",
+              : "bg-[#D31145] text-white hover:bg-[#b50f3a]",
           ].join(" ")}
         >
           <FileText className="h-4 w-4" />
@@ -855,7 +894,7 @@ export default function SummaryPage() {
         </button>
         <button
           type="button"
-          onClick={() => startMockLoading("relayout")}
+          onClick={startMockRelayout}
           disabled={relayoutLoading}
           className={[
             "inline-flex h-12 w-full items-center justify-center gap-2 rounded-xl border px-4 text-sm font-semibold",
@@ -916,9 +955,77 @@ export default function SummaryPage() {
                 <div className="space-y-6">
                   <div className="space-y-2">
                     <div className="text-sm font-medium">二级保障明细</div>
-                    {drawer.account !== "wealth" && drawerLevel2Details.length > 0 ? (
+                    {drawer.account === "health" ? (
+                      drawerMember.status === "pending" ? (
+                        <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900/80">
+                          <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                          该成员当前仅有投保人视图数据，二级/三级保障明细待补充。
+                        </div>
+                      ) : (
+                        <div className="space-y-4">
+                          <div className="space-y-2">
+                            <div className="text-sm font-medium text-zinc-800">
+                              重疾
+                            </div>
+                            {drawerMember.accounts.healthCritical.level2Details.length > 0 ? (
+                              <div className="divide-y divide-zinc-100 rounded-xl border border-zinc-200 bg-white">
+                                {drawerMember.accounts.healthCritical.level2Details.map((item) => (
+                                  <div
+                                    key={`critical:${item.name}`}
+                                    className="flex items-center justify-between gap-3 px-4 py-3"
+                                  >
+                                    <div className="min-w-0 truncate text-sm text-zinc-700">
+                                      {item.name}
+                                    </div>
+                                    <div className="shrink-0 text-sm font-semibold tabular-nums text-zinc-900">
+                                      {formatNumber(item.amount)}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <div className="text-sm text-zinc-600">暂无重疾二级明细</div>
+                            )}
+                          </div>
+
+                          <div className="space-y-2">
+                            <div className="text-sm font-medium text-zinc-800">
+                              医疗
+                            </div>
+                            {drawerMember.accounts.healthMedical.level2Details.length > 0 ? (
+                              <div className="divide-y divide-zinc-100 rounded-xl border border-zinc-200 bg-white">
+                                {drawerMember.accounts.healthMedical.level2Details.map((item) => (
+                                  <div
+                                    key={`medical:${item.name}`}
+                                    className="flex items-center justify-between gap-3 px-4 py-3"
+                                  >
+                                    <div className="min-w-0 truncate text-sm text-zinc-700">
+                                      {item.name}
+                                    </div>
+                                    <div className="shrink-0 text-sm font-semibold tabular-nums text-zinc-900">
+                                      {formatNumber(item.amount)}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <div className="text-sm text-zinc-600">暂无医疗二级明细</div>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    ) : drawer.account === "wealth" ? (
+                      <div className="text-sm text-zinc-600">
+                        财富账户以保单维度归集“累计已交保费”，不展示二级保障表。
+                      </div>
+                    ) : drawerMember.status === "pending" ? (
+                      <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900/80">
+                        <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                        该成员当前仅有投保人视图数据，二级/三级保障明细待补充。
+                      </div>
+                    ) : drawerMember.accounts.lifeDeath.level2Details.length > 0 ? (
                       <div className="divide-y divide-zinc-100 rounded-xl border border-zinc-200 bg-white">
-                        {drawerLevel2Details.map((item) => (
+                        {drawerMember.accounts.lifeDeath.level2Details.map((item) => (
                           <div
                             key={item.name}
                             className="flex items-center justify-between gap-3 px-4 py-3"
@@ -932,21 +1039,12 @@ export default function SummaryPage() {
                           </div>
                         ))}
                       </div>
-                    ) : drawer.account === "wealth" ? (
-                      <div className="text-sm text-zinc-600">
-                        财富账户以保单维度归集“累计已交保费”，不展示二级保障表。
-                      </div>
-                    ) : drawerMember.status === "pending" ? (
-                      <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900/80">
-                        <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
-                        该成员当前仅有投保人视图数据，二级/三级保障明细待补充。
-                      </div>
                     ) : (
                       <div className="text-sm text-zinc-600">暂无二级保障明细</div>
                     )}
                   </div>
 
-                  {drawer.account === "lifeDeath" && drawerMember.role === "self" ? (
+                  {drawer.account === "life" && drawerMember.role === "self" ? (
                     <div className="space-y-2">
                       <div className="text-sm font-medium">三级保障（精读）</div>
                       {drawerMember.accounts.lifeDeath.level3Details.length > 0 ? (
@@ -1031,6 +1129,84 @@ export default function SummaryPage() {
           </div>
         </div>
       </div>
+
+      {debugDialog ? (
+        <div className="fixed inset-0 z-[120] pointer-events-auto">
+          <div
+            onClick={() => setDebugDialog(null)}
+            className="absolute inset-0 bg-black/30"
+          />
+          <div className="absolute left-1/2 top-1/2 w-[min(92vw,920px)] -translate-x-1/2 -translate-y-1/2">
+            <div className="rounded-2xl border border-zinc-200 bg-white shadow-xl">
+              <div className="flex items-start justify-between gap-3 border-b border-zinc-200 px-4 py-4">
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold">
+                    Debug：client_data_json（发给 Coze）
+                  </div>
+                  <div className="mt-1 text-xs text-zinc-500">
+                    可一键复制到 Coze 平台做离线测试
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const text = debugDialog.jsonText;
+                      if (!text) return;
+                      try {
+                        await navigator.clipboard.writeText(text);
+                        setDebugCopied(true);
+                        window.setTimeout(() => setDebugCopied(false), 1200);
+                      } catch {
+                        console.log(text);
+                      }
+                    }}
+                    className="inline-flex h-9 items-center justify-center rounded-lg bg-[#D31145] px-3 text-sm font-medium text-white hover:bg-[#b50f3a]"
+                  >
+                    {debugCopied ? "已复制" : "一键复制"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDebugForceEnabled(false);
+                      setDebugDialog(null);
+                      setDebugCopied(false);
+                      debugClickRef.current = { count: 0, lastAt: 0 };
+                    }}
+                    className="inline-flex h-9 items-center justify-center rounded-lg border border-zinc-200 bg-white px-3 text-sm font-medium text-zinc-900 hover:bg-zinc-50"
+                  >
+                    关闭并重置唤醒
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDebugDialog(null)}
+                    className="inline-flex h-9 items-center justify-center rounded-lg border border-zinc-200 bg-white px-3 text-sm font-medium text-zinc-900 hover:bg-zinc-50"
+                  >
+                    关闭
+                  </button>
+                </div>
+              </div>
+              <div className="max-h-[60vh] overflow-y-auto px-4 py-4">
+                <pre className="whitespace-pre-wrap break-words rounded-xl border border-zinc-200 bg-zinc-50 p-4 text-xs text-zinc-800">
+                  {debugDialog.jsonText}
+                </pre>
+              </div>
+              <div className="flex items-center justify-end gap-2 border-t border-zinc-200 px-4 py-4">
+                <button
+                  type="button"
+                  onClick={async () => {
+                    setDebugDialog(null);
+                    await runInterpretAndGo(debugDialog.strategy, debugDialog.clientDataJson);
+                  }}
+                  className="inline-flex h-10 items-center justify-center rounded-lg bg-[#D31145] px-4 text-sm font-semibold text-white hover:bg-[#b50f3a]"
+                >
+                  确认并查看报告
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

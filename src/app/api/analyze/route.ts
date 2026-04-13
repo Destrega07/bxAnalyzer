@@ -1,3 +1,8 @@
+import { spawn } from "child_process";
+import { mkdtemp, readFile, rm, writeFile } from "fs/promises";
+import { tmpdir } from "os";
+import path from "path";
+
 const COZE_BASE_URL = (process.env.COZE_API_BASE ?? "https://api.coze.cn").replace(/\/+$/, "");
 const COZE_API_TOKEN = process.env.COZE_API_TOKEN ?? "";
 const COZE_BOT_ID = process.env.COZE_BOT_ID ?? "";
@@ -128,6 +133,193 @@ async function uploadToCoze(file: File) {
     return { ok: false as const, status: 502, body: { msg: "Upload succeeded but file_id missing", raw: json ?? text } };
   }
   return { ok: true as const, fileId, raw: json ?? text };
+}
+
+function extractPasswordField(form: FormData) {
+  const raw = form.get("password") ?? form.get("pdf_password") ?? form.get("pdfPassword");
+  if (typeof raw === "string") return raw;
+  return "";
+}
+
+function encodeRFC5987ValueChars(str: string) {
+  return encodeURIComponent(str).replace(/[!'()*]/g, (c) => {
+    return `%${c.charCodeAt(0).toString(16).toUpperCase()}`;
+  });
+}
+
+function buildAttachmentContentDisposition(filename: string) {
+  const cleaned = filename.replace(/[/\\]/g, "_").replace(/["\r\n]/g, "").trim() || "report.pdf";
+  const ascii = cleaned.replace(/[^\x20-\x7E]/g, "_");
+  const encoded = encodeRFC5987ValueChars(cleaned);
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+}
+
+function looksLikePdf(bytes: Uint8Array) {
+  if (bytes.length < 5) return false;
+  return Buffer.from(bytes.slice(0, 5)).toString("ascii") === "%PDF-";
+}
+
+function detectPdfEncryptedFromBytes(bytes: Uint8Array) {
+  const windowSize = Math.min(bytes.length, 1024 * 1024);
+  const head = Buffer.from(bytes.slice(0, windowSize)).toString("latin1");
+  const tail = Buffer.from(bytes.slice(Math.max(0, bytes.length - windowSize))).toString("latin1");
+  return head.includes("/Encrypt") || tail.includes("/Encrypt");
+}
+
+type CommandResult = {
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+  code: number | null;
+  errorCode?: string;
+  errorMessage?: string;
+};
+
+async function runCommand(exe: string, args: string[]): Promise<CommandResult> {
+  return new Promise((resolve) => {
+    let child: ReturnType<typeof spawn> | null = null;
+    try {
+      child = spawn(exe, args, { stdio: ["ignore", "pipe", "pipe"] });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err ?? "");
+      resolve({ ok: false, stdout: "", stderr: "", code: null, errorCode: "SPAWN_THROW", errorMessage: msg });
+      return;
+    }
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+
+    child.stdout?.on("data", (d) => stdoutChunks.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
+    child.stderr?.on("data", (d) => stderrChunks.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
+    child.on("error", (err) => {
+      const msg = err instanceof Error ? err.message : String(err ?? "");
+      const code = typeof (err as { code?: unknown }).code === "string" ? String((err as { code?: unknown }).code) : "";
+      resolve({
+        ok: false,
+        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+        code: null,
+        errorCode: code || "SPAWN_ERROR",
+        errorMessage: msg,
+      });
+    });
+    child.on("close", (code) => {
+      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+      const stderr = Buffer.concat(stderrChunks).toString("utf8");
+      resolve({ ok: code === 0, stdout, stderr, code });
+    });
+  });
+}
+
+function isLocalDevHost(host: string | null) {
+  if (!host) return false;
+  const h = host.toLowerCase();
+  return h.includes("localhost") || h.includes("127.0.0.1");
+}
+
+async function checkQpdfAvailable() {
+  const r = await runCommand("qpdf", ["--version"]);
+  if (r.ok) return { ok: true as const };
+  const missing = r.errorCode === "ENOENT";
+  return { ok: false as const, missing, detail: r.errorMessage || r.stderr || r.stdout || "" };
+}
+
+async function decryptPdfWithQpdf(bytes: Uint8Array, password: string) {
+  const dir = await mkdtemp(path.join(tmpdir(), "ipis-pdf-"));
+  const inputPath = path.join(dir, "input.pdf");
+  const outputPath = path.join(dir, "output.pdf");
+  try {
+    await writeFile(inputPath, Buffer.from(bytes));
+    const result = await runCommand("qpdf", [
+      `--password=${password}`,
+      "--decrypt",
+      inputPath,
+      outputPath,
+    ]);
+    if (!result.ok) {
+      if (result.errorCode === "ENOENT") {
+        return { ok: false as const, unsupported: true, stderr: "" };
+      }
+      const stderr = result.stderr || result.stdout || "";
+      const lowered = stderr.toLowerCase();
+      const isPasswordError =
+        lowered.includes("invalid password") ||
+        lowered.includes("incorrect password") ||
+        lowered.includes("bad password") ||
+        lowered.includes("password");
+      return { ok: false as const, passwordError: isPasswordError, stderr };
+    }
+    const out = await readFile(outputPath);
+    return { ok: true as const, bytes: new Uint8Array(out) };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function maybeDecryptIncomingPdf(file: File, password: string, opts: { host: string | null }) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (!looksLikePdf(bytes)) {
+    return {
+      ok: false as const,
+      error: { code: "PDF_INVALID", msg: "文件不是有效的 PDF" },
+      status: 400,
+    };
+  }
+
+  const encrypted = detectPdfEncryptedFromBytes(bytes);
+  if (!encrypted) {
+    return { ok: true as const, file, bytes };
+  }
+
+  const qpdf = await checkQpdfAvailable();
+  if (!qpdf.ok) {
+    const devLocal = process.env.NODE_ENV !== "production" && isLocalDevHost(opts.host);
+    if (devLocal) {
+      return {
+        ok: false as const,
+        error: { code: "QPDF_MISSING", msg: "本地环境缺少 qpdf，请先安装" },
+        status: 500,
+      };
+    }
+    return {
+      ok: false as const,
+      error: { code: "PDF_DECRYPT_UNSUPPORTED", msg: "服务端未安装PDF解密组件" },
+      status: 500,
+    };
+  }
+
+  if (!password.trim().length) {
+    return {
+      ok: false as const,
+      error: { code: "PDF_PASSWORD_REQUIRED", msg: "PDF已加密，请输入查询密码" },
+      status: 400,
+    };
+  }
+
+  const decrypted = await decryptPdfWithQpdf(bytes, password.trim());
+  if (!decrypted.ok) {
+    if ("unsupported" in decrypted && decrypted.unsupported) {
+      return {
+        ok: false as const,
+        error: { code: "PDF_DECRYPT_UNSUPPORTED", msg: "服务端未安装PDF解密组件" },
+        status: 500,
+      };
+    }
+    if (decrypted.passwordError) {
+      return {
+        ok: false as const,
+        error: { code: "PDF_PASSWORD_INCORRECT", msg: "密码错误" },
+        status: 400,
+      };
+    }
+    return {
+      ok: false as const,
+      error: { code: "PDF_DECRYPT_FAILED", msg: decrypted.stderr || "PDF解密失败" },
+      status: 502,
+    };
+  }
+
+  const outFile = new File([decrypted.bytes], file.name, { type: file.type || "application/pdf" });
+  return { ok: true as const, file: outFile, bytes: decrypted.bytes };
 }
 
 async function createChatWithFallbacks(fileId: string) {
@@ -317,7 +509,13 @@ export async function POST(req: Request) {
     );
   }
 
+  const url = new URL(req.url);
   const form = await req.formData();
+  const password = extractPasswordField(form);
+  const debugDownloadRaw = url.searchParams.get("debug_download") ?? form.get("debug_download");
+  const debugDownload =
+    typeof debugDownloadRaw === "string" &&
+    ["1", "true", "yes", "on"].includes(debugDownloadRaw.trim().toLowerCase());
   const fileLike = form.get("file") ?? form.get("pdf") ?? form.get("pdfFile");
   if (!(fileLike instanceof File)) {
     return Response.json({ error: "FormData must include a PDF file field named 'file'" }, { status: 400 });
@@ -326,7 +524,26 @@ export async function POST(req: Request) {
     return Response.json({ error: "Empty file" }, { status: 400 });
   }
 
-  const upload = await uploadToCoze(fileLike);
+  const maybeDecrypted = await maybeDecryptIncomingPdf(fileLike, password, { host: req.headers.get("host") });
+  if (!maybeDecrypted.ok) {
+    return Response.json({ step: "decrypt", error: maybeDecrypted.error }, { status: maybeDecrypted.status });
+  }
+
+  if (debugDownload) {
+    const filenameBase = fileLike.name.replace(/\.pdf$/i, "");
+    const filename = `${filenameBase || "report"}-decrypted.pdf`;
+    const contentDisposition = buildAttachmentContentDisposition(filename);
+    return new Response(Buffer.from(maybeDecrypted.bytes), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/pdf",
+        "Content-Disposition": contentDisposition,
+        "Cache-Control": "no-store",
+      },
+    });
+  }
+
+  const upload = await uploadToCoze(maybeDecrypted.file);
   if (!upload.ok) {
     console.error("[api/analyze] upload failed", upload.status);
     return Response.json({ step: "upload", error: upload.body }, { status: upload.status });

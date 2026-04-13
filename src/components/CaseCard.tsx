@@ -1,10 +1,12 @@
 "use client";
 
-import type { CaseRecord, CaseStatus, CaseSummary } from "@/lib/db";
+import type { CaseRecord, CaseStatus, CaseSummaryWithClassification } from "@/lib/db";
+import { getClassificationPillClasses } from "@/lib/classifier";
+import { getRatingPillClasses } from "@/lib/scoringEngine";
 
 type Props = {
   caseId: number;
-  summary: CaseSummary;
+  summary: CaseSummaryWithClassification;
   active: boolean;
   onSelect: () => void;
   onStatusChange: (status: CaseStatus) => void;
@@ -76,7 +78,19 @@ export default function CaseCard({ summary, active, onSelect, onStatusChange, on
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <span className={["h-2.5 w-2.5 rounded-full", getStatusDot(summary.status)].join(" ")} />
-            <div className="truncate text-sm font-semibold">{name}</div>
+            <div className="flex min-w-0 items-center gap-2">
+              <div className="min-w-0 truncate text-sm font-semibold">{name}</div>
+              {summary.classification ? (
+                <span className={getClassificationPillClasses(summary.classification.id)}>
+                  {summary.classification.label}
+                </span>
+              ) : null}
+              {summary.ratingLabel ? (
+                <span className={getRatingPillClasses(summary.ratingLabel)}>
+                  {summary.ratingLabel}
+                </span>
+              ) : null}
+            </div>
           </div>
           <div className="mt-1 text-xs text-zinc-600">
             有效保单: {policyCount}件 | 累计保费: {totalPremium.length ? totalPremium : "-"}
