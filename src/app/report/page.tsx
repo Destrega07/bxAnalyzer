@@ -112,6 +112,25 @@ function getStrategyLabel(strategy: ReportStrategy) {
   return "方案测试";
 }
 
+function splitAdvisorOnlySection(markdown: string) {
+  const lines = markdown.replace(/\r\n?/g, "\n").split("\n");
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    if (lines[i]?.trim() !== "---") continue;
+    const candidates: string[] = [];
+    for (let j = i + 1; j < lines.length && candidates.length < 2; j += 1) {
+      const t = (lines[j] ?? "").trim();
+      if (!t) continue;
+      candidates.push(t);
+    }
+    const isAdvisorOnly = candidates.some((t) => t.includes("专家锦囊"));
+    if (!isAdvisorOnly) continue;
+    const main = lines.slice(0, i).join("\n").trim();
+    const priv = lines.slice(i + 1).join("\n").trim();
+    return { main, private: priv };
+  }
+  return { main: markdown.trim(), private: "" };
+}
+
 export default function ReportPage() {
   return (
     <Suspense
@@ -137,6 +156,7 @@ function ReportPageInner() {
   const [strategy, setStrategy] = useState<ReportStrategy>("professional_premium");
   const [editEnabled, setEditEnabled] = useState(false);
   const [editedMarkdown, setEditedMarkdown] = useState("");
+  const [plannerName, setPlannerName] = useState("");
   const [loadingError, setLoadingError] = useState<string | null>(null);
   const [loadingHintIndex, setLoadingHintIndex] = useState(0);
   const [loadingProgress, setLoadingProgress] = useState(0);
@@ -145,6 +165,12 @@ function ReportPageInner() {
   const exportRef = useRef<HTMLDivElement | null>(null);
 
   const draft = activeCase?.reportDraft ?? null;
+
+  useEffect(() => {
+    const key = `ipis:plannerName:${activeCase?.id ?? "active"}`;
+    const stored = typeof window !== "undefined" ? window.localStorage.getItem(key) : null;
+    if (stored != null) setPlannerName(stored);
+  }, [activeCase?.id]);
 
   useEffect(() => {
     if (!draft?.markdown) return;
@@ -282,12 +308,12 @@ function ReportPageInner() {
 
   const rendered = useMemo(() => {
     const base = (editEnabled ? editedMarkdown : draft?.markdown) ?? "";
-    if (!base) return { main: "" };
+    if (!base) return { main: "", private: "" };
     const label = getStrategyLabel(strategy);
     const withStrategy = base.includes("**话术策略：**")
       ? base.replace(/\*\*话术策略：\*\*.+/g, `**话术策略：** ${label}`)
       : `**话术策略：** ${label}\n\n${base}`;
-    return { main: withStrategy.trim() };
+    return splitAdvisorOnlySection(withStrategy);
   }, [draft?.markdown, editEnabled, editedMarkdown, strategy]);
 
   async function persistEditedMarkdown(nextMarkdown: string) {
@@ -305,7 +331,11 @@ function ReportPageInner() {
     const el = exportRef.current;
     if (!el) return;
     const { toPng } = await import("html-to-image");
-    const dataUrl = await toPng(el, { cacheBust: true, pixelRatio: 2 });
+    const dataUrl = await toPng(el, {
+      cacheBust: true,
+      pixelRatio: 2,
+      backgroundColor: "#ffffff",
+    });
     const a = document.createElement("a");
     a.href = dataUrl;
     const name = activeCase?.customerName?.trim() || "客户";
@@ -505,13 +535,43 @@ function ReportPageInner() {
 
           <div ref={exportRef} className="mt-6 border-t border-zinc-200 pt-6">
             <MarkdownView markdown={rendered.main} />
-            <div className="mt-6 rounded-xl border border-zinc-200 bg-zinc-50 px-4 py-3 text-sm text-zinc-700">
-              您的专属保障规划师：[待自定义]
+            <div className="mt-6 text-sm text-zinc-800">
+              <span className="text-zinc-700">您的专属保障规划师：</span>
+              <input
+                value={plannerName}
+                onChange={(e) => {
+                  const next = e.target.value;
+                  setPlannerName(next);
+                  const key = `ipis:plannerName:${activeCase?.id ?? "active"}`;
+                  try {
+                    window.localStorage.setItem(key, next);
+                  } catch {}
+                }}
+                placeholder="请填入你的姓名"
+                className="ml-1 inline-block w-[min(52vw,260px)] border-b border-zinc-300 bg-transparent px-1 py-0.5 text-lg font-semibold text-zinc-900 outline-none placeholder:text-zinc-400 focus:border-zinc-500"
+                style={{ fontFamily: "cursive" }}
+              />
             </div>
             <div className="mt-4 text-center text-xs text-zinc-500">
               友邦保险 · 健康长久好生活
             </div>
           </div>
+
+          {rendered.private ? (
+            <div className="mt-6 rounded-2xl border border-rose-200 bg-rose-50 p-4">
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div className="text-sm font-semibold text-[#D31145]">
+                  仅顾问可见
+                </div>
+                <div className="text-xs text-rose-900/70">
+                  不会输出到PNG长图中
+                </div>
+              </div>
+              <div className="mt-3">
+                <MarkdownView markdown={rendered.private} />
+              </div>
+            </div>
+          ) : null}
         </div>
       )}
     </div>

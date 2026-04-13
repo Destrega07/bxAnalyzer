@@ -63,10 +63,12 @@ function extractMonthlyPremiums(parsed: ReturnType<typeof parseMarkdownTables>) 
   for (const section of parsed.sections) {
     if (!section.heading.includes("月度交费备忘录")) continue;
     for (const table of section.tables) {
-      if (!table.headers.includes("年月") || !table.headers.includes("保费合计")) continue;
+      const ymHeader = table.headers.find((h) => h.trim() === "年月") ?? "";
+      const premiumHeader = table.headers.find((h) => h.trim().startsWith("保费合计")) ?? "";
+      if (!ymHeader || !premiumHeader) continue;
       table.rows.forEach((row) => {
-        const ym = (row["年月"] ?? "").trim();
-        const total = (row["保费合计"] ?? "").trim();
+        const ym = (row[ymHeader] ?? "").trim();
+        const total = (row[premiumHeader] ?? "").trim();
         if (!ym) return;
         rows.push({ yearMonth: ym, totalPremium: total });
       });

@@ -287,15 +287,8 @@ async function maybeDecryptIncomingPdf(file: File, password: string, opts: { hos
     };
   }
 
-  if (!password.trim().length) {
-    return {
-      ok: false as const,
-      error: { code: "PDF_PASSWORD_REQUIRED", msg: "PDF已加密，请输入查询密码" },
-      status: 400,
-    };
-  }
-
-  const decrypted = await decryptPdfWithQpdf(bytes, password.trim());
+  const trimmedPassword = password.trim();
+  const decrypted = await decryptPdfWithQpdf(bytes, trimmedPassword);
   if (!decrypted.ok) {
     if ("unsupported" in decrypted && decrypted.unsupported) {
       return {
@@ -305,6 +298,13 @@ async function maybeDecryptIncomingPdf(file: File, password: string, opts: { hos
       };
     }
     if (decrypted.passwordError) {
+      if (!trimmedPassword.length) {
+        return {
+          ok: false as const,
+          error: { code: "PDF_PASSWORD_REQUIRED", msg: "PDF已加密，请输入查询密码" },
+          status: 400,
+        };
+      }
       return {
         ok: false as const,
         error: { code: "PDF_PASSWORD_INCORRECT", msg: "密码错误" },
@@ -566,4 +566,3 @@ export async function POST(req: Request) {
     { status: 202, headers: { "X-Coze-Bot-Id": COZE_BOT_ID } },
   );
 }
-
