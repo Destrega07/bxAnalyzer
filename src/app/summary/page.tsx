@@ -22,9 +22,9 @@ function formatNumber(value: number) {
   return value.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
 }
 
-function percent(value: number, max: number) {
-  if (!Number.isFinite(value) || !Number.isFinite(max) || max <= 0) return 0;
-  return Math.max(0, Math.min(100, Math.round((value / max) * 100)));
+function formatCurrency(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return "-";
+  return `￥${value.toLocaleString("zh-CN", { maximumFractionDigits: 2 })}`;
 }
 
 function parseNumberLoose(input: string) {
@@ -381,22 +381,43 @@ export default function SummaryPage() {
     return summary.members.filter((m) => m.status !== "pending");
   }, [hidePending, summary.members]);
 
-  const maxByAccount = useMemo(() => {
-    const maxHealthCritical = Math.max(
-      0,
-      ...members.map((m) => m.accounts.healthCritical.mainAmount),
-    );
-    const maxHealthMedical = Math.max(
-      0,
-      ...members.map((m) => m.accounts.healthMedical.annualLimit),
-    );
-    const maxLife = Math.max(0, ...members.map((m) => m.accounts.lifeDeath.amount));
-    const maxWealth = Math.max(
-      0,
-      ...members.map((m) => m.accounts.wealth.paidPremium),
-    );
-    return { maxHealthCritical, maxHealthMedical, maxLife, maxWealth };
-  }, [members]);
+  const scorePercentByMember = useMemo(() => {
+    const allConfirmedPolicies = confirmedRows.map((r) => r.row);
+    const findInsured = (row: Record<string, string>) =>
+      String(
+        row["被保人"] ??
+          row["被保险人"] ??
+          row["被保人姓名"] ??
+          row["被保人名称"] ??
+          row["客户姓名"] ??
+          "",
+      ).trim();
+
+    const byMember = new Map<string, { health: number; life: number; wealth: number }>();
+    members.forEach((m) => {
+      const memberPolicies = allConfirmedPolicies.filter((row) => findInsured(row) === m.insuredName);
+      if (memberPolicies.length <= 0) {
+        byMember.set(m.insuredName, { health: 0, life: 0, wealth: 0 });
+        return;
+      }
+      const details = computeProtectionScoreDetails({
+        persona: state.persona,
+        parsed: state.parsed,
+        confirmedPolicies: memberPolicies,
+      });
+      const accountPercent = (account: "健康账户" | "生命账户" | "财富账户") => {
+        const row = details?.accounts.find((a) => a.account === account);
+        if (!row || row.maxScore <= 0) return 0;
+        return Math.max(0, Math.min(100, Math.round((row.score / row.maxScore) * 100)));
+      };
+      byMember.set(m.insuredName, {
+        health: accountPercent("健康账户"),
+        life: accountPercent("生命账户"),
+        wealth: accountPercent("财富账户"),
+      });
+    });
+    return byMember;
+  }, [confirmedRows, members, state.parsed, state.persona]);
 
   const overviewMeta = state.cardMeta[overviewCardId];
   const overviewFields = overviewMeta?.overviewFields ?? {};
@@ -455,6 +476,7 @@ export default function SummaryPage() {
         ],
         scoringItems: details?.items ?? [],
         confirmedPolicyRows: confirmedRows.map((r) => ({ id: r.id, row: r.row })),
+        monthlyPremiums: state.cardMeta["memo:monthlyPremiums"]?.monthlyPremiums ?? [],
       });
       const clientDataJson = buildClientDataJson({ strategy, snapshot });
 
@@ -619,6 +641,12 @@ export default function SummaryPage() {
             const hasLinked =
               m.accounts.healthCritical.policies.some((p) => p.isLinked) ||
               m.accounts.lifeDeath.policies.some((p) => p.isLinked);
+            const scorePercent = scorePercentByMember.get(m.insuredName) ?? {
+              health: 0,
+              life: 0,
+              wealth: 0,
+            };
+            const isSelf = m.role === "self";
 
             const cardTone =
               m.status === "pending"
@@ -727,24 +755,25 @@ export default function SummaryPage() {
                             重疾
                           </div>
                           <div className="text-sm font-semibold tabular-nums">
-                            {formatNumber(m.accounts.healthCritical.mainAmount)}
+                            {isSelf
+                              ? `${scorePercent.health}% | ${formatCurrency(m.accounts.healthCritical.mainAmount)}`
+                              : formatCurrency(m.accounts.healthCritical.mainAmount)}
                           </div>
                         </div>
                         <div className="mt-1 text-[11px] text-zinc-500">
                           含中症/轻症：{formatNumber(m.accounts.healthCritical.middleAmount)} /{" "}
                           {formatNumber(m.accounts.healthCritical.lightAmount)}
                         </div>
-                        <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-zinc-100">
-                          <div
-                            className="h-full rounded-full bg-emerald-500 transition-[width]"
-                            style={{
-                              width: `${percent(
-                                m.accounts.healthCritical.mainAmount,
-                                maxByAccount.maxHealthCritical,
-                              )}%`,
-                            }}
-                          />
-                        </div>
+                        {isSelf ? (
+                          <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-zinc-100">
+                            <div
+                              className="h-full rounded-full bg-emerald-500 transition-[width]"
+                              style={{
+                                width: `${scorePercent.health}%`,
+                              }}
+                            />
+                          </div>
+                        ) : null}
                       </div>
                       <div>
                         <div className="flex items-center justify-between gap-3">
@@ -752,20 +781,21 @@ export default function SummaryPage() {
                             医疗
                           </div>
                           <div className="text-sm font-semibold tabular-nums">
-                            {formatNumber(m.accounts.healthMedical.annualLimit)}
+                            {isSelf
+                              ? `${scorePercent.health}% | ${formatCurrency(m.accounts.healthMedical.annualLimit)}`
+                              : formatCurrency(m.accounts.healthMedical.annualLimit)}
                           </div>
                         </div>
-                        <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-zinc-100">
-                          <div
-                            className="h-full rounded-full bg-sky-500 transition-[width]"
-                            style={{
-                              width: `${percent(
-                                m.accounts.healthMedical.annualLimit,
-                                maxByAccount.maxHealthMedical,
-                              )}%`,
-                            }}
-                          />
-                        </div>
+                        {isSelf ? (
+                          <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-zinc-100">
+                            <div
+                              className="h-full rounded-full bg-sky-500 transition-[width]"
+                              style={{
+                                width: `${scorePercent.health}%`,
+                              }}
+                            />
+                          </div>
+                        ) : null}
                       </div>
                     </div>
                   </button>
@@ -786,21 +816,22 @@ export default function SummaryPage() {
                           </span>
                         ) : null}
                         <div className="text-sm font-semibold tabular-nums">
-                          {formatNumber(m.accounts.lifeDeath.amount)}
+                          {isSelf
+                            ? `${scorePercent.life}% | ${formatCurrency(m.accounts.lifeDeath.amount)}`
+                            : formatCurrency(m.accounts.lifeDeath.amount)}
                         </div>
                       </div>
                     </div>
-                    <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-zinc-100">
-                      <div
-                        className="h-full rounded-full bg-indigo-500 transition-[width]"
-                        style={{
-                          width: `${percent(
-                            m.accounts.lifeDeath.amount,
-                            maxByAccount.maxLife,
-                          )}%`,
-                        }}
-                      />
-                    </div>
+                    {isSelf ? (
+                      <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-zinc-100">
+                        <div
+                          className="h-full rounded-full bg-indigo-500 transition-[width]"
+                          style={{
+                            width: `${scorePercent.life}%`,
+                          }}
+                        />
+                      </div>
+                    ) : null}
                     {expanded &&
                     m.status === "active" &&
                     m.accounts.lifeDeath.level2Details.length > 0 ? (
@@ -835,20 +866,21 @@ export default function SummaryPage() {
                         财富账户（已交保费）
                       </div>
                       <div className="text-sm font-semibold tabular-nums">
-                        {formatNumber(m.accounts.wealth.paidPremium)}
+                        {isSelf
+                          ? `${scorePercent.wealth}% | ${formatCurrency(m.accounts.wealth.paidPremium)}`
+                          : formatCurrency(m.accounts.wealth.paidPremium)}
                       </div>
                     </div>
-                    <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-zinc-100">
-                      <div
-                        className="h-full rounded-full bg-fuchsia-500 transition-[width]"
-                        style={{
-                          width: `${percent(
-                            m.accounts.wealth.paidPremium,
-                            maxByAccount.maxWealth,
-                          )}%`,
-                        }}
-                      />
-                    </div>
+                    {isSelf ? (
+                      <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-zinc-100">
+                        <div
+                          className="h-full rounded-full bg-fuchsia-500 transition-[width]"
+                          style={{
+                            width: `${scorePercent.wealth}%`,
+                          }}
+                        />
+                      </div>
+                    ) : null}
                   </button>
                 </div>
               </div>

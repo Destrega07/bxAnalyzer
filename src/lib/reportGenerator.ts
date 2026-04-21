@@ -7,6 +7,7 @@ export type ReportSnapshot = {
     name: string;
     persona: CustomerPersona;
   };
+  monthlyPremiums: Array<{ yearMonth: string; totalPremium: number }>;
   scoring: {
     totalScore: number;
     ratingLabel: ProtectionRatingLabel | null;
@@ -55,6 +56,11 @@ function parseAmountLoose(value: string) {
   return num;
 }
 
+function parseNumberLoose(value: unknown) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+  return parseAmountLoose(String(value ?? ""));
+}
+
 export function buildClientDataJson(params: {
   strategy: ReportStrategy;
   snapshot: ReportSnapshot;
@@ -73,6 +79,7 @@ export function buildReportSnapshot(params: {
   scoringAccounts: ReportSnapshot["scoring"]["accounts"];
   scoringItems: ReportSnapshot["scoring"]["items"];
   confirmedPolicyRows: Array<{ id: string; row: Record<string, string> }>;
+  monthlyPremiums: Array<{ yearMonth?: unknown; totalPremium?: unknown }>;
 }) {
   const now = Date.now();
   const policies = params.confirmedPolicyRows.map((p) => {
@@ -91,6 +98,13 @@ export function buildReportSnapshot(params: {
     };
   });
 
+  const monthlyPremiums = (params.monthlyPremiums ?? [])
+    .map((r) => ({
+      yearMonth: String(r?.yearMonth ?? "").trim(),
+      totalPremium: parseNumberLoose(r?.totalPremium),
+    }))
+    .filter((r) => r.yearMonth.length > 0);
+
   const snapshot: ReportSnapshot = {
     schemaVersion: 1,
     generatedAt: now,
@@ -98,6 +112,7 @@ export function buildReportSnapshot(params: {
       name: params.persona.customerName,
       persona: params.persona,
     },
+    monthlyPremiums,
     scoring: {
       totalScore: params.totalScore,
       ratingLabel: params.ratingLabel,
@@ -109,4 +124,3 @@ export function buildReportSnapshot(params: {
 
   return snapshot;
 }
-

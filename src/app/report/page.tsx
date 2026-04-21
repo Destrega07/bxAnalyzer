@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useCaseContext } from "@/context/CaseContext";
 import type { ReportStrategy } from "@/lib/db";
@@ -28,81 +28,255 @@ function renderInlineBold(text: string) {
   return parts;
 }
 
-function MarkdownView({ markdown }: { markdown: string }) {
-  const lines = markdown.replace(/\r\n?/g, "\n").split("\n");
+type ScoreAccountBar = {
+  account: "健康账户" | "生命账户" | "财富账户";
+  score: number;
+  maxScore: number;
+};
+
+function parseScoreAccountBars(clientDataJson: unknown): ScoreAccountBar[] {
+  const snapshot =
+    typeof clientDataJson === "object" && clientDataJson !== null
+      ? (clientDataJson as { snapshot?: unknown }).snapshot
+      : null;
+  const scoring =
+    typeof snapshot === "object" && snapshot !== null
+      ? (snapshot as { scoring?: unknown }).scoring
+      : null;
+  const accounts =
+    typeof scoring === "object" && scoring !== null
+      ? (scoring as { accounts?: unknown }).accounts
+      : null;
+  if (!Array.isArray(accounts)) return [];
+  const labels = new Set(["健康账户", "生命账户", "财富账户"]);
+  return accounts
+    .map((row) => {
+      const account = typeof row === "object" && row !== null ? (row as { account?: unknown }).account : "";
+      const score = typeof row === "object" && row !== null ? (row as { score?: unknown }).score : 0;
+      const maxScore = typeof row === "object" && row !== null ? (row as { maxScore?: unknown }).maxScore : 0;
+      return {
+        account: typeof account === "string" && labels.has(account) ? (account as ScoreAccountBar["account"]) : null,
+        score: Number(score),
+        maxScore: Number(maxScore),
+      };
+    })
+    .filter((row): row is ScoreAccountBar => row.account !== null)
+    .map((row) => ({
+      account: row.account,
+      score: Number.isFinite(row.score) ? row.score : 0,
+      maxScore: Number.isFinite(row.maxScore) ? row.maxScore : 0,
+    }));
+}
+
+function renderInlineParts(parts: Array<{ type: "text" | "strong"; value: string }>) {
+  return parts.map((p, i) =>
+    p.type === "strong" ? (
+      <strong key={i} className="font-semibold text-[#D31145]">
+        {p.value}
+      </strong>
+    ) : (
+      <span key={i}>{p.value}</span>
+    ),
+  );
+}
+
+function stripListPrefix(line: string) {
+  return line.replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/, "");
+}
+
+function splitPipeRow(line: string) {
+  let text = stripListPrefix(line).trim();
+  if (text.startsWith("|")) text = text.slice(1);
+  if (text.endsWith("|")) text = text.slice(0, -1);
+  return text.split("|").map((c) => c.trim());
+}
+
+function isTableSeparatorLine(line: string) {
+  const cells = splitPipeRow(line);
+  if (cells.length === 0) return false;
+  return cells.every((c) => /^:?\s*-+\s*:?$/.test(c));
+}
+
+function shouldInsertAccountChart(line: string) {
+  const normalized = stripListPrefix(line)
+    .replace(/\*/g, "")
+    .replace(/\s+/g, "");
+  return /03[｜|]三大账户总览/.test(normalized);
+}
+
+function AccountScoreBars({ accounts }: { accounts: ScoreAccountBar[] }) {
+  const orderedAccounts: ScoreAccountBar["account"][] = ["健康账户", "生命账户", "财富账户"];
+  const rows = orderedAccounts.map((account) => {
+    const matched = accounts.find((a) => a.account === account);
+    return {
+      account,
+      score: matched?.score ?? 0,
+      maxScore: matched?.maxScore ?? 0,
+    };
+  });
+
   return (
-    <div className="space-y-2">
-      {lines.map((line, idx) => {
-        const raw = line.trimEnd();
-        if (!raw) return <div key={`sp:${idx}`} className="h-2" />;
-        if (raw.trim() === "---") {
+    <div className="my-3 rounded-xl border border-zinc-200 bg-white p-3">
+      <div className="text-xs font-semibold text-zinc-700">三大账户得分</div>
+      <div className="mt-2 space-y-2">
+        {rows.map((row) => {
+          const percent =
+            row.maxScore > 0
+              ? Math.max(0, Math.min(100, Math.round((row.score / row.maxScore) * 100)))
+              : 0;
           return (
-            <div
-              key={`hr:${idx}`}
-              className="my-4 border-t border-zinc-200"
-            />
-          );
-        }
-        const heading = raw.match(/^(#{1,6})\s*(.*)$/);
-        if (heading) {
-          const level = heading[1]?.length ?? 1;
-          const title = heading[2] ?? "";
-          if (level <= 1) {
-            return (
-              <h2 key={`h1:${idx}`} className="text-lg font-semibold tracking-tight text-zinc-900">
-                {title}
-              </h2>
-            );
-          }
-          if (level === 2) {
-            return (
-              <h3 key={`h2:${idx}`} className="pt-2 text-base font-semibold text-zinc-900">
-                {title}
-              </h3>
-            );
-          }
-          return (
-            <h4 key={`h3:${idx}`} className="pt-2 text-sm font-semibold text-zinc-900">
-              {title}
-            </h4>
-          );
-        }
-        const li = raw.match(/^-+\s+(.*)$/);
-        if (li) {
-          const parts = renderInlineBold(li[1]);
-          return (
-            <div key={`li:${idx}`} className="flex gap-2 text-sm text-zinc-800">
-              <div className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-zinc-400" />
-              <div className="min-w-0">
-                {parts.map((p, i) =>
-                  p.type === "strong" ? (
-                    <strong key={i} className="font-semibold text-[#D31145]">
-                      {p.value}
-                    </strong>
-                  ) : (
-                    <span key={i}>{p.value}</span>
-                  ),
-                )}
+            <div key={row.account}>
+              <div className="flex items-center justify-between text-xs text-zinc-700">
+                <span>{row.account}</span>
+                <span className="tabular-nums">
+                  {row.score}/{row.maxScore}
+                </span>
+              </div>
+              <div
+                className="mt-1 h-2 w-full overflow-hidden rounded-full"
+                style={{ backgroundColor: percent < 100 ? "#F4F4F5" : "transparent" }}
+              >
+                <div
+                  className="h-full rounded-full bg-[#D31145] transition-[width]"
+                  style={{ width: `${percent}%`, backgroundColor: "#D31145" }}
+                />
               </div>
             </div>
           );
-        }
-        const parts = renderInlineBold(raw);
-        return (
-          <p key={`p:${idx}`} className="text-sm leading-6 text-zinc-800">
-            {parts.map((p, i) =>
-              p.type === "strong" ? (
-                <strong key={i} className="font-semibold text-[#D31145]">
-                  {p.value}
-                </strong>
-              ) : (
-                <span key={i}>{p.value}</span>
-              ),
-            )}
-          </p>
-        );
-      })}
+        })}
+      </div>
     </div>
+  );
+}
+
+function MarkdownView({ markdown, scoreAccounts }: { markdown: string; scoreAccounts: ScoreAccountBar[] }) {
+  const lines = markdown.replace(/\r\n?/g, "\n").split("\n");
+  const nodes: ReactNode[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i] ?? "";
+    const raw = line.trimEnd();
+    const key = `${i}:${raw.slice(0, 16)}`;
+    const strippedRaw = stripListPrefix(raw);
+
+    if (!raw) {
+      nodes.push(<div key={`sp:${key}`} className="h-2" />);
+      i += 1;
+      continue;
+    }
+    if (strippedRaw.trim() === "[ACCOUNT_CHART]") {
+      nodes.push(<AccountScoreBars key={`chart:${key}`} accounts={scoreAccounts} />);
+      i += 1;
+      continue;
+    }
+    if (strippedRaw.includes("|") && i + 1 < lines.length && isTableSeparatorLine(lines[i + 1] ?? "")) {
+      const headers = splitPipeRow(strippedRaw);
+      const bodyRows: string[][] = [];
+      let j = i + 2;
+      while (j < lines.length) {
+        const rowText = (lines[j] ?? "").trim();
+        const strippedRowText = stripListPrefix(rowText).trim();
+        if (!strippedRowText || !strippedRowText.includes("|")) break;
+        bodyRows.push(splitPipeRow(strippedRowText));
+        j += 1;
+      }
+      nodes.push(
+        <div key={`tb:${key}`} className="my-3 w-full overflow-x-auto rounded-xl border border-zinc-200">
+          <table className="w-full min-w-full border-separate border-spacing-0 text-sm text-zinc-800">
+            <thead>
+              <tr>
+                {headers.map((cell, idx) => (
+                  <th
+                    key={`th:${idx}`}
+                    className="border-b border-[#D31145] bg-zinc-50 px-4 py-3 text-left font-semibold text-zinc-900"
+                  >
+                    {renderInlineParts(renderInlineBold(cell))}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {bodyRows.map((row, ridx) => (
+                <tr key={`tr:${ridx}`}>
+                  {headers.map((_, cidx) => (
+                    <td key={`td:${ridx}:${cidx}`} className="border-t border-zinc-100 px-4 py-2.5 align-top">
+                      {renderInlineParts(renderInlineBold(row[cidx] ?? ""))}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>,
+      );
+      i = j;
+      continue;
+    }
+    if (raw.trim() === "---") {
+      nodes.push(<div key={`hr:${key}`} className="my-4 border-t border-zinc-200" />);
+      i += 1;
+      continue;
+    }
+    const heading = raw.match(/^(#{1,6})\s*(.*)$/);
+    if (heading) {
+      const level = heading[1]?.length ?? 1;
+      const title = heading[2] ?? "";
+      if (level <= 1) {
+        nodes.push(
+          <h2 key={`h1:${key}`} className="text-lg font-semibold tracking-tight text-zinc-900">
+            {title}
+          </h2>,
+        );
+      } else if (level === 2) {
+        nodes.push(
+          <h3 key={`h2:${key}`} className="pt-2 text-base font-semibold text-zinc-900">
+            {title}
+          </h3>,
+        );
+      } else {
+        nodes.push(
+          <h4 key={`h3:${key}`} className="pt-2 text-sm font-semibold text-zinc-900">
+            {title}
+          </h4>,
+        );
+      }
+      const hasNearbyPlaceholder = lines
+        .slice(i + 1, i + 4)
+        .some((nextLine) => stripListPrefix(nextLine ?? "").trim() === "[ACCOUNT_CHART]");
+      if (shouldInsertAccountChart(raw) && !hasNearbyPlaceholder) {
+        nodes.push(<AccountScoreBars key={`chart:title:${key}`} accounts={scoreAccounts} />);
+      }
+      i += 1;
+      continue;
+    }
+    const li = raw.match(/^-+\s+(.*)$/);
+    if (li) {
+      nodes.push(
+        <div key={`li:${key}`} className="flex gap-2 text-sm text-zinc-800">
+          <div className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-zinc-400" />
+          <div className="min-w-0">{renderInlineParts(renderInlineBold(li[1]))}</div>
+        </div>,
+      );
+      i += 1;
+      continue;
+    }
+    nodes.push(
+      <p key={`p:${key}`} className="text-sm leading-6 text-zinc-800">
+        {renderInlineParts(renderInlineBold(raw))}
+      </p>,
+    );
+    const hasNearbyPlaceholder = lines
+      .slice(i + 1, i + 4)
+      .some((nextLine) => stripListPrefix(nextLine ?? "").trim() === "[ACCOUNT_CHART]");
+    if (shouldInsertAccountChart(raw) && !hasNearbyPlaceholder) {
+      nodes.push(<AccountScoreBars key={`chart:line:${key}`} accounts={scoreAccounts} />);
+    }
+    i += 1;
+  }
+
+  return (
+    <div className="space-y-2">{nodes}</div>
   );
 }
 
@@ -165,6 +339,10 @@ function ReportPageInner() {
   const exportRef = useRef<HTMLDivElement | null>(null);
 
   const draft = activeCase?.reportDraft ?? null;
+  const scoreAccounts = useMemo(
+    () => parseScoreAccountBars(draft?.clientDataJson),
+    [draft?.clientDataJson],
+  );
 
   useEffect(() => {
     const key = `ipis:plannerName:${activeCase?.id ?? "active"}`;
@@ -534,7 +712,7 @@ function ReportPageInner() {
           </div>
 
           <div ref={exportRef} className="mt-6 border-t border-zinc-200 pt-6">
-            <MarkdownView markdown={rendered.main} />
+            <MarkdownView markdown={rendered.main} scoreAccounts={scoreAccounts} />
             <div className="mt-6 text-sm text-zinc-800">
               <span className="text-zinc-700">您的专属保障规划师：</span>
               <input
@@ -568,7 +746,7 @@ function ReportPageInner() {
                 </div>
               </div>
               <div className="mt-3">
-                <MarkdownView markdown={rendered.private} />
+                <MarkdownView markdown={rendered.private} scoreAccounts={scoreAccounts} />
               </div>
             </div>
           ) : null}
