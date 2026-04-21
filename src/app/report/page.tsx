@@ -84,15 +84,22 @@ function stripListPrefix(line: string) {
   return line.replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/, "");
 }
 
+function normalizeTablePipes(line: string) {
+  return line.replace(/｜/g, "|");
+}
+
 function splitPipeRow(line: string) {
-  let text = stripListPrefix(line).trim();
+  let text = normalizeTablePipes(stripListPrefix(line)).trim();
   if (text.startsWith("|")) text = text.slice(1);
   if (text.endsWith("|")) text = text.slice(0, -1);
   return text.split("|").map((c) => c.trim());
 }
 
 function isTableSeparatorLine(line: string) {
-  const cells = splitPipeRow(line);
+  const normalized = normalizeTablePipes(stripListPrefix(line)).trim();
+  if (!normalized) return false;
+  if (!normalized.includes("|")) return /^:?\s*-+\s*:?$/.test(normalized);
+  const cells = splitPipeRow(normalized);
   if (cells.length === 0) return false;
   return cells.every((c) => /^:?\s*-+\s*:?$/.test(c));
 }
@@ -102,6 +109,42 @@ function shouldInsertAccountChart(line: string) {
     .replace(/\*/g, "")
     .replace(/\s+/g, "");
   return /03[｜|]三大账户总览/.test(normalized);
+}
+
+function isAccountOverviewSubheading(line: string) {
+  const normalized = stripListPrefix(line)
+    .replace(/\*/g, "")
+    .trim();
+  return (
+    /^A[｜|]健康账户（医疗与重疾）$/.test(normalized) ||
+    /^B[｜|]生命账户（意外与寿险）$/.test(normalized) ||
+    /^C[｜|]财富账户（长期储蓄与传承）$/.test(normalized)
+  );
+}
+
+function getTodayDateLabel() {
+  const text = new Date().toLocaleDateString("zh-CN", {
+    timeZone: "Asia/Shanghai",
+  });
+  const nums = text.match(/\d+/g) ?? [];
+  const y = nums[0] ?? String(new Date().getFullYear());
+  const m = nums[1] ?? String(new Date().getMonth() + 1);
+  const d = nums[2] ?? String(new Date().getDate());
+  return `${Number(y)}年${Number(m)}月${Number(d)}日`;
+}
+
+function normalizeReportTitleDate(markdown: string) {
+  const lines = markdown.replace(/\r\n?/g, "\n").split("\n");
+  const idx = lines.findIndex((line) => line.trim().length > 0);
+  if (idx < 0) return markdown;
+  const today = getTodayDateLabel();
+  const original = lines[idx] ?? "";
+  let updated = original.replace(/([—-]\s*)20\d{2}年\d{1,2}月\d{1,2}日/g, `$1${today}`);
+  if (updated === original) {
+    updated = updated.replace(/20\d{2}年\d{1,2}月\d{1,2}日/g, today);
+  }
+  lines[idx] = updated;
+  return lines.join("\n");
 }
 
 function AccountScoreBars({ accounts }: { accounts: ScoreAccountBar[] }) {
@@ -170,14 +213,24 @@ function MarkdownView({ markdown, scoreAccounts }: { markdown: string; scoreAcco
       i += 1;
       continue;
     }
-    if (strippedRaw.includes("|") && i + 1 < lines.length && isTableSeparatorLine(lines[i + 1] ?? "")) {
+    const nextStrippedRaw = stripListPrefix(lines[i + 1] ?? "").trim();
+    const shouldStartTable =
+      /[|｜]/.test(strippedRaw) && i + 1 < lines.length && /[|｜]/.test(nextStrippedRaw);
+    if (shouldStartTable) {
       const headers = splitPipeRow(strippedRaw);
       const bodyRows: string[][] = [];
-      let j = i + 2;
+      let j = i + 1;
+      if (isTableSeparatorLine(nextStrippedRaw)) {
+        j = i + 2;
+      }
       while (j < lines.length) {
         const rowText = (lines[j] ?? "").trim();
         const strippedRowText = stripListPrefix(rowText).trim();
-        if (!strippedRowText || !strippedRowText.includes("|")) break;
+        if (!strippedRowText || !/[|｜]/.test(strippedRowText)) break;
+        if (isTableSeparatorLine(strippedRowText)) {
+          j += 1;
+          continue;
+        }
         bodyRows.push(splitPipeRow(strippedRowText));
         j += 1;
       }
@@ -189,7 +242,7 @@ function MarkdownView({ markdown, scoreAccounts }: { markdown: string; scoreAcco
                 {headers.map((cell, idx) => (
                   <th
                     key={`th:${idx}`}
-                    className="border-b border-[#D31145] bg-zinc-50 px-4 py-3 text-left font-semibold text-zinc-900"
+                    className="border-b-2 border-b-[#D31145] border-r border-zinc-200 bg-zinc-50 px-4 py-3 text-left font-semibold text-zinc-900 last:border-r-0"
                   >
                     {renderInlineParts(renderInlineBold(cell))}
                   </th>
@@ -200,7 +253,10 @@ function MarkdownView({ markdown, scoreAccounts }: { markdown: string; scoreAcco
               {bodyRows.map((row, ridx) => (
                 <tr key={`tr:${ridx}`}>
                   {headers.map((_, cidx) => (
-                    <td key={`td:${ridx}:${cidx}`} className="border-t border-zinc-100 px-4 py-2.5 align-top">
+                    <td
+                      key={`td:${ridx}:${cidx}`}
+                      className="border-t border-r border-zinc-200 px-4 py-3 align-top last:border-r-0"
+                    >
                       {renderInlineParts(renderInlineBold(row[cidx] ?? ""))}
                     </td>
                   ))}
@@ -257,6 +313,15 @@ function MarkdownView({ markdown, scoreAccounts }: { markdown: string; scoreAcco
           <div className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-zinc-400" />
           <div className="min-w-0">{renderInlineParts(renderInlineBold(li[1]))}</div>
         </div>,
+      );
+      i += 1;
+      continue;
+    }
+    if (isAccountOverviewSubheading(raw)) {
+      nodes.push(
+        <p key={`acc-h:${key}`} className="pt-1 text-sm font-semibold text-zinc-900">
+          {renderInlineParts(renderInlineBold(stripListPrefix(raw).trim()))}
+        </p>,
       );
       i += 1;
       continue;
@@ -332,6 +397,7 @@ function ReportPageInner() {
   const [editedMarkdown, setEditedMarkdown] = useState("");
   const [plannerName, setPlannerName] = useState("");
   const [loadingError, setLoadingError] = useState<string | null>(null);
+  const [debugRawExpanded, setDebugRawExpanded] = useState(false);
   const [loadingHintIndex, setLoadingHintIndex] = useState(0);
   const [loadingProgress, setLoadingProgress] = useState(0);
   const loadingStartedAtRef = useRef<number>(0);
@@ -487,12 +553,13 @@ function ReportPageInner() {
   const rendered = useMemo(() => {
     const base = (editEnabled ? editedMarkdown : draft?.markdown) ?? "";
     if (!base) return { main: "", private: "" };
-    const label = getStrategyLabel(strategy);
-    const withStrategy = base.includes("**话术策略：**")
-      ? base.replace(/\*\*话术策略：\*\*.+/g, `**话术策略：** ${label}`)
-      : `**话术策略：** ${label}\n\n${base}`;
-    return splitAdvisorOnlySection(withStrategy);
-  }, [draft?.markdown, editEnabled, editedMarkdown, strategy]);
+    const normalizedDateMarkdown = normalizeReportTitleDate(base);
+    const withoutStrategy = normalizedDateMarkdown
+      .replace(/\*\*话术策略：\*\*.*(?:\n|$)/g, "")
+      .replace(/^\s*话术策略：.*(?:\n|$)/gm, "")
+      .trim();
+    return splitAdvisorOnlySection(withoutStrategy);
+  }, [draft?.markdown, editEnabled, editedMarkdown]);
 
   async function persistEditedMarkdown(nextMarkdown: string) {
     if (!draft) return;
@@ -711,7 +778,12 @@ function ReportPageInner() {
             </button>
           </div>
 
-          <div ref={exportRef} className="mt-6 border-t border-zinc-200 pt-6">
+          <div className="mt-4 text-sm text-zinc-700">
+            <span className="font-semibold text-[#D31145]">话术策略：</span>{" "}
+            {getStrategyLabel(strategy)}
+          </div>
+
+          <div ref={exportRef} className="mt-6 border-t border-zinc-200 px-[6px] pt-6">
             <MarkdownView markdown={rendered.main} scoreAccounts={scoreAccounts} />
             <div className="mt-6 text-sm text-zinc-800">
               <span className="text-zinc-700">您的专属保障规划师：</span>
@@ -750,6 +822,20 @@ function ReportPageInner() {
               </div>
             </div>
           ) : null}
+
+          <details
+            className="mt-6 rounded-2xl border border-zinc-200 bg-white p-4"
+            onToggle={(e) => setDebugRawExpanded((e.currentTarget as HTMLDetailsElement).open)}
+          >
+            <summary className="cursor-pointer text-sm font-semibold text-zinc-800">
+              Coze 传输原文（Debug）
+            </summary>
+            {debugRawExpanded ? (
+              <pre className="mt-3 overflow-x-auto rounded-lg bg-zinc-100 p-3 text-xs leading-5 text-zinc-800">
+                {draft.markdown}
+              </pre>
+            ) : null}
+          </details>
         </div>
       )}
     </div>
