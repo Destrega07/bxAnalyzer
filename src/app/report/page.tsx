@@ -236,13 +236,16 @@ function MarkdownView({ markdown, scoreAccounts }: { markdown: string; scoreAcco
       }
       nodes.push(
         <div key={`tb:${key}`} className="my-3 w-full overflow-x-auto rounded-xl border border-zinc-200">
-          <table className="w-full min-w-full border-separate border-spacing-0 text-sm text-zinc-800">
+          <table className="table-auto w-full min-w-full border-separate border-spacing-0 text-sm text-zinc-800">
             <thead>
               <tr>
                 {headers.map((cell, idx) => (
                   <th
                     key={`th:${idx}`}
-                    className="border-b-2 border-b-[#D31145] border-r border-zinc-200 bg-zinc-50 px-4 py-3 text-left font-semibold text-zinc-900 last:border-r-0"
+                    className={[
+                      "border-b-2 border-b-[#D31145] border-r border-zinc-200 bg-zinc-50 px-4 py-3 text-left font-semibold text-zinc-900 last:border-r-0",
+                        idx === 0 ? "min-w-[140px] max-w-[280px] whitespace-normal break-words" : "",
+                    ].join(" ")}
                   >
                     {renderInlineParts(renderInlineBold(cell))}
                   </th>
@@ -255,7 +258,10 @@ function MarkdownView({ markdown, scoreAccounts }: { markdown: string; scoreAcco
                   {headers.map((_, cidx) => (
                     <td
                       key={`td:${ridx}:${cidx}`}
-                      className="border-t border-r border-zinc-200 px-4 py-3 align-top last:border-r-0"
+                      className={[
+                        "border-t border-r border-zinc-200 px-4 py-3 align-top last:border-r-0",
+                        cidx === 0 ? "min-w-[140px] max-w-[280px] whitespace-normal break-words" : "",
+                      ].join(" ")}
                     >
                       {renderInlineParts(renderInlineBold(row[cidx] ?? ""))}
                     </td>
@@ -576,18 +582,63 @@ function ReportPageInner() {
     const el = exportRef.current;
     if (!el) return;
     const { toPng } = await import("html-to-image");
-    const dataUrl = await toPng(el, {
-      cacheBust: true,
-      pixelRatio: 2,
-      backgroundColor: "#ffffff",
-    });
-    const a = document.createElement("a");
-    a.href = dataUrl;
-    const name = activeCase?.customerName?.trim() || "客户";
-    a.download = `${name}-保障解读.png`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
+    const tableElements = Array.from(el.querySelectorAll("table"));
+    const tableWrappers = Array.from(
+      new Set(
+        tableElements
+          .map((table) => table.closest("div.overflow-x-auto"))
+          .filter((node): node is HTMLDivElement => node instanceof HTMLDivElement),
+      ),
+    );
+    const wrapperSnapshots = tableWrappers.map((wrapper) => ({
+      wrapper,
+      className: wrapper.className,
+      overflow: wrapper.style.overflow,
+    }));
+    const elStyleSnapshot = {
+      width: el.style.width,
+      minWidth: el.style.minWidth,
+      maxWidth: el.style.maxWidth,
+    };
+    try {
+      wrapperSnapshots.forEach(({ wrapper }) => {
+        wrapper.classList.remove("overflow-x-auto");
+        wrapper.style.overflow = "visible";
+      });
+      const contentWidth = Math.max(
+        el.scrollWidth,
+        ...tableElements.map((table) => table.scrollWidth),
+      );
+      el.style.width = "fit-content";
+      el.style.minWidth = `${contentWidth}px`;
+      el.style.maxWidth = "none";
+      const dataUrl = await toPng(el, {
+        cacheBust: true,
+        pixelRatio: 2,
+        backgroundColor: "#ffffff",
+        style: {
+          width: `${contentWidth}px`,
+          minWidth: `${contentWidth}px`,
+          maxWidth: "none",
+          backgroundColor: "#ffffff",
+        },
+      });
+      const a = document.createElement("a");
+      a.href = dataUrl;
+      const name = activeCase?.customerName?.trim() || "客户";
+      a.download = `${name}-保障解读.png`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } finally {
+      wrapperSnapshots.forEach(({ wrapper, className, overflow }) => {
+        wrapper.className = className;
+        wrapper.style.overflow = overflow;
+      });
+      el.style.width = elStyleSnapshot.width;
+      el.style.minWidth = elStyleSnapshot.minWidth;
+      el.style.maxWidth = elStyleSnapshot.maxWidth;
+    }
   }
 
   function downloadTextFile(filename: string, text: string) {
